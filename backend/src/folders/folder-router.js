@@ -2,6 +2,7 @@ const express = require('express');
 
 const rolesByAction = {
   read: new Set(['OWNER', 'EDITOR', 'VIEWER']),
+  renameFolder: new Set(['OWNER', 'EDITOR']),
   upload: new Set(['OWNER', 'EDITOR']),
   updateDocument: new Set(['OWNER', 'EDITOR']),
   deleteDocument: new Set(['OWNER']),
