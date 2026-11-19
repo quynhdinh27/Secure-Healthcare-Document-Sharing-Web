@@ -15,14 +15,13 @@ CREATE TABLE Folder_Membership (
     active_user_id BIGINT UNSIGNED GENERATED ALWAYS AS (
         CASE WHEN status = 'ACTIVE' THEN user_id END
     ) STORED,
-    active_owner_folder_id CHAR(36) CHARACTER SET ascii COLLATE ascii_bin
-        GENERATED ALWAYS AS (
-            CASE WHEN status = 'ACTIVE' AND role = 'OWNER' THEN folder_id END
-        ) STORED,
+    active_owner_marker TINYINT GENERATED ALWAYS AS (
+        CASE WHEN status = 'ACTIVE' AND role = 'OWNER' THEN 1 END
+    ) STORED,
 
     PRIMARY KEY (membership_id),
     UNIQUE KEY uq_folder_active_member (folder_id, active_user_id),
-    UNIQUE KEY uq_folder_active_owner (active_owner_folder_id),
+    UNIQUE KEY uq_folder_active_owner (folder_id, active_owner_marker),
     KEY ix_folder_membership_user_status (user_id, status, folder_id),
     CONSTRAINT fk_folder_membership_folder
         FOREIGN KEY (folder_id) REFERENCES Treatment_Folder (folder_id),
