@@ -1,0 +1,9 @@
+CREATE TABLE Treatment_Folder (
+    folder_id CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+    patient_ref VARCHAR(255) NOT NULL,
+    episode_ref VARCHAR(255) NOT NULL,
+    folder_name VARCHAR(255) NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (folder_id)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4;
