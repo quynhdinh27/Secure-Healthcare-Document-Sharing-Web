@@ -42,6 +42,15 @@ function createFolderRouter({ authenticate, folderRepository } = {}) {
     response.json({ ...entry.folder, role: entry.membership.role });
   });
 
+  router.get('/:folderId/members', async function listFolderMembers(request, response) {
+    if (typeof folderRepository.listMembersForUser !== 'function') {
+      return response.status(503).json({ code: 'FOLDER_SERVICE_UNAVAILABLE' });
+    }
+    const members = await folderRepository.listMembersForUser(request.user.id, request.params.folderId);
+    if (!members) return response.status(403).json({ code: 'FORBIDDEN' });
+    response.json({ members });
+  });
+
   router.patch('/:folderId', express.json(), async function updateFolder(request, response) {
     const { name } = request.body ?? {};
     if (typeof name !== 'string' || !name.trim() || Object.keys(request.body).length !== 1) {
