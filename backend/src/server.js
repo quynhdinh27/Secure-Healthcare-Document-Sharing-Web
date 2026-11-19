@@ -1,7 +1,8 @@
 const express = require('express');
 const { createFolderRouter } = require('./folders/folder-router');
+const { createMysqlFolderRepository } = require('./folders/mysql-folder-repository');
 
-function createApp({ authenticate, folderRepository } = {}) {
+function createApp({ authenticate, mysqlPool, folderRepository } = {}) {
   const app = express();
 
   app.get('/health/live', (_request, response) => {
@@ -35,7 +36,8 @@ function createApp({ authenticate, folderRepository } = {}) {
       </html>
     `);
   });
-  app.use('/api/v1/folders', createFolderRouter({ authenticate, folderRepository }));
+  const repository = folderRepository ?? (mysqlPool && createMysqlFolderRepository(mysqlPool));
+  app.use('/api/v1/folders', createFolderRouter({ authenticate, folderRepository: repository }));
   app.use((error, _request, response, next) => {
     if (response.headersSent) return next(error);
     if (error.type === 'entity.parse.failed') {
