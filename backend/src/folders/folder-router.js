@@ -16,7 +16,7 @@ function hasFolderPermission(membership, action) {
     && rolesByAction[action].has(membership.role);
 }
 
-function createFolderRouter({ authenticate, folderRepository } = {}) {
+function createFolderRouter({ authenticate, folderRepository, verifyInitialFolderPolicy } = {}) {
   const router = express.Router();
 
   if (authenticate) router.use(authenticate);
@@ -32,6 +32,30 @@ function createFolderRouter({ authenticate, folderRepository } = {}) {
       .filter(({ membership }) => hasFolderPermission(membership, 'read'))
       .map(({ folder, membership }) => ({ ...folder, role: membership.role }));
     response.json({ folders });
+  });
+
+  router.post('/', express.json(), async function createFolder(request, response) {
+    const { folderId, name, patientRef, treatmentReference, signedPolicy } = request.body ?? {};
+    const metadata = [name, patientRef, treatmentReference];
+    if (typeof folderId !== 'string'
+        || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(folderId)
+        || !metadata.every((value) => typeof value === 'string' && value.trim() && value.trim().length <= 255)
+        || !signedPolicy || typeof signedPolicy !== 'object' || Array.isArray(signedPolicy)) {
+      return response.status(400).json({ code: 'INVALID_FOLDER_INPUT' });
+    }
+    if (typeof verifyInitialFolderPolicy !== 'function' || typeof folderRepository.createForOwner !== 'function') {
+      return response.status(503).json({ code: 'FOLDER_SERVICE_UNAVAILABLE' });
+    }
+
+    const result = await folderRepository.createForOwner({
+      folder: { folderId, name: name.trim(), patientRef: patientRef.trim(), treatmentReference: treatmentReference.trim() },
+      ownerId: request.user.id,
+      signedPolicy,
+      verifyInitialFolderPolicy,
+    });
+    if (result.code === 'INVALID_SIGNATURE') return response.status(422).json(result);
+    if (result.code === 'FOLDER_ALREADY_EXISTS') return response.status(409).json(result);
+    response.status(201).location('/api/v1/folders/' + folderId).json(result.folder);
   });
 
   router.get('/:folderId', async function getFolder(request, response) {

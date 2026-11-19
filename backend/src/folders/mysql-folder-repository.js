@@ -14,6 +14,48 @@ function createMysqlFolderRepository(pool) {
   const findFolderQuery = memberFoldersQuery + ' AND f.folder_id = ?';
 
   return {
+    async createForOwner({ folder, ownerId, signedPolicy, verifyInitialFolderPolicy }) {
+      const connection = await pool.getConnection();
+      try {
+        await connection.beginTransaction();
+        // The verifier checks the active signing key and binds policy version 1
+        // to this folder, this owner and the initial owner-only membership.
+        const verified = await verifyInitialFolderPolicy({ connection, folder, ownerId, signedPolicy, policyVersion: 1 });
+        if (verified !== true) {
+          await connection.rollback();
+          return { code: 'INVALID_SIGNATURE' };
+        }
+
+        try {
+          await connection.execute(
+            'INSERT INTO Treatment_Folder (folder_id, folder_name, patient_ref, episode_ref) VALUES (?, ?, ?, ?)',
+            [folder.folderId, folder.name, folder.patientRef, folder.treatmentReference],
+          );
+        } catch (error) {
+          if (error.code !== 'ER_DUP_ENTRY') throw error;
+          await connection.rollback();
+          return { code: 'FOLDER_ALREADY_EXISTS' };
+        }
+        await connection.execute(
+          "INSERT INTO Folder_Membership (folder_id, user_id, role, granted_by) VALUES (?, ?, 'OWNER', ?)",
+          [folder.folderId, ownerId, ownerId],
+        );
+        await connection.execute(
+          'INSERT INTO Folder_Policy (folder_id, policy_version, signed_policy) VALUES (?, 1, ?)',
+          [folder.folderId, JSON.stringify(signedPolicy)],
+        );
+        const [[row]] = await connection.execute(findFolderQuery, [ownerId, folder.folderId]);
+        const entry = toEntry(row);
+        await connection.commit();
+        return { folder: { ...entry.folder, role: entry.membership.role, policyVersion: 1 } };
+      } catch (error) {
+        await connection.rollback();
+        throw error;
+      } finally {
+        connection.release();
+      }
+    },
+
     async listForUser(userId) {
       const [rows] = await pool.execute(
         memberFoldersQuery + ' ORDER BY f.updated_at DESC, f.folder_id',
