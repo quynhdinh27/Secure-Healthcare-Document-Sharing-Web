@@ -2,7 +2,7 @@ const express = require('express');
 const { createFolderRouter } = require('./folders/folder-router');
 const { createMysqlFolderRepository } = require('./folders/mysql-folder-repository');
 
-function createApp({ authenticate, mysqlPool, folderRepository } = {}) {
+function createApp({ authenticate, mysqlPool, folderRepository, verifyInitialFolderPolicy } = {}) {
   const app = express();
 
   app.get('/health/live', (_request, response) => {
@@ -37,7 +37,9 @@ function createApp({ authenticate, mysqlPool, folderRepository } = {}) {
     `);
   });
   const repository = folderRepository ?? (mysqlPool && createMysqlFolderRepository(mysqlPool));
-  app.use('/api/v1/folders', createFolderRouter({ authenticate, folderRepository: repository }));
+  app.use('/api/v1/folders', createFolderRouter({
+    authenticate, folderRepository: repository, verifyInitialFolderPolicy,
+  }));
   const dashboard = express.Router();
   if (authenticate) dashboard.use(authenticate);
   dashboard.get('/summary', async function getDashboardSummary(request, response) {
