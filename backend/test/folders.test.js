@@ -53,3 +53,64 @@ test('folder endpoints use authenticated identity and expose only active members
     assert.equal((await fetch(base + '/api/v1/folders/' + id, { headers })).status, 403);
   }
 });
+
+test('folder rename updates the name only for active owners and editors', async (t) => {
+  const folder = { folderId: 'A', name: 'Original' };
+  const memberships = {
+    owner: { status: 'ACTIVE', role: 'OWNER' },
+    editor: { status: 'ACTIVE', role: 'EDITOR' },
+    viewer: { status: 'ACTIVE', role: 'VIEWER' },
+    revoked: { status: 'REVOKED', role: 'EDITOR' },
+    changing: { status: 'ACTIVE', role: 'EDITOR' },
+  };
+  const app = createApp({
+    authenticate(request, _response, next) {
+      const token = request.get('authorization');
+      if (token) request.user = { id: token.slice('Bearer '.length) };
+      next();
+    },
+    folderRepository: {
+      async findForUser(userId, folderId) {
+        const membership = memberships[userId];
+        if (membership && folderId === folder.folderId) return { folder, membership };
+      },
+      async renameForUser(userId, folderId, name, allowedRoles) {
+        assert.equal(folderId, folder.folderId);
+        const membership = memberships[userId];
+        if (userId === 'changing') membership.status = 'REVOKED';
+        assert.ok(allowedRoles.includes(membership.role));
+        if (membership.status !== 'ACTIVE') return null;
+        folder.name = name;
+        return { folder, membership };
+      },
+    },
+  });
+  const server = app.listen(0, '127.0.0.1');
+  t.after(() => server.close());
+  await once(server, 'listening');
+  const url = `http://127.0.0.1:${server.address().port}/api/v1/folders/A`;
+  const rename = (userId, body) => fetch(url, {
+    method: 'PATCH',
+    headers: {
+      'content-type': 'application/json',
+      ...(userId && { authorization: 'Bearer ' + userId }),
+    },
+    body,
+  });
+
+  for (const userId of ['owner', 'editor']) {
+    const result = await rename(userId, JSON.stringify({ name: '  ' + userId + '  ' }));
+    assert.equal(result.status, 200);
+    assert.deepEqual(await result.json(), { folderId: 'A', name: userId, role: memberships[userId].role });
+    assert.equal(folder.name, userId);
+  }
+
+  for (const userId of ['viewer', 'revoked', 'outsider', 'changing']) {
+    assert.equal((await rename(userId, '{"name":"Denied"}')).status, 403);
+  }
+  assert.equal((await rename(null, '{"name":"Denied"}')).status, 401);
+  for (const body of ['{}', '{"name":42}', '{"name":" "}', '{"name":"Valid","role":"OWNER"}', '{']) {
+    assert.equal((await rename('editor', body)).status, 400);
+  }
+  assert.equal(folder.name, 'editor');
+});

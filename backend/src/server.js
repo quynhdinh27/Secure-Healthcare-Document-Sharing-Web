@@ -38,6 +38,12 @@ function createApp({ authenticate, folderRepository } = {}) {
   app.use('/api/v1/folders', createFolderRouter({ authenticate, folderRepository }));
   app.use((error, _request, response, next) => {
     if (response.headersSent) return next(error);
+    if (error.type === 'entity.parse.failed') {
+      return response.status(400).json({ code: 'INVALID_JSON' });
+    }
+    if (error.type === 'entity.too.large') {
+      return response.status(413).json({ code: 'PAYLOAD_TOO_LARGE' });
+    }
     console.error(error);
     response.status(500).json({ code: 'INTERNAL_ERROR' });
   });

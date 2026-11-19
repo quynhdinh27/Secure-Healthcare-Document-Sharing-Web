@@ -42,6 +42,32 @@ function createFolderRouter({ authenticate, folderRepository } = {}) {
     response.json({ ...entry.folder, role: entry.membership.role });
   });
 
+  router.patch('/:folderId', express.json(), async function updateFolder(request, response) {
+    const { name } = request.body ?? {};
+    if (typeof name !== 'string' || !name.trim() || Object.keys(request.body).length !== 1) {
+      return response.status(400).json({ code: 'INVALID_FOLDER_NAME' });
+    }
+
+    const userId = request.user.id;
+    const { folderId } = request.params;
+    const entry = await folderRepository.findForUser(userId, folderId);
+    if (!hasFolderPermission(entry?.membership, 'renameFolder')) {
+      return response.status(403).json({ code: 'FORBIDDEN' });
+    }
+    if (typeof folderRepository.renameForUser !== 'function') {
+      return response.status(503).json({ code: 'FOLDER_SERVICE_UNAVAILABLE' });
+    }
+
+    // The repository must check active membership and role in the same operation as the write.
+    const updated = await folderRepository.renameForUser(
+      userId, folderId, name.trim(), [...rolesByAction.renameFolder],
+    );
+    if (!updated) {
+      return response.status(403).json({ code: 'FORBIDDEN' });
+    }
+    response.json({ ...updated.folder, role: updated.membership.role });
+  });
+
   return router;
 }
 
