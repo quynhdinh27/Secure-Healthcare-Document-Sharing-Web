@@ -75,6 +75,29 @@ function createFolderRouter({ authenticate, folderRepository, verifyInitialFolde
     response.json({ members });
   });
 
+  router.post('/:folderId/policy-contexts', express.json(), async function createPolicyContext(request, response) {
+    const { action, userId, membershipId, role } = request.body ?? {};
+    const idPattern = /^[1-9][0-9]{0,19}$/;
+    const validId = (id) => typeof id === 'string' && idPattern.test(id) && BigInt(id) <= 18446744073709551615n;
+    const validRole = role === 'EDITOR' || role === 'VIEWER';
+    const target = action === 'ADD_MEMBER' && validId(userId) && validRole
+      ? { userId, role }
+      : action === 'CHANGE_ROLE' && validId(membershipId) && validRole
+        ? { membershipId, role }
+        : action === 'REVOKE_MEMBER' && validId(membershipId)
+          ? { membershipId }
+          : null;
+    if (!target) return response.status(400).json({ code: 'INVALID_POLICY_CONTEXT_INPUT' });
+    if (typeof folderRepository.createPolicyContext !== 'function') {
+      return response.status(503).json({ code: 'FOLDER_SERVICE_UNAVAILABLE' });
+    }
+
+    const result = await folderRepository.createPolicyContext(request.user.id, request.params.folderId, action, target);
+    if (result.code === 'FORBIDDEN') return response.status(403).json(result);
+    if (result.code) return response.status(409).json(result);
+    response.status(201).json(result);
+  });
+
   router.patch('/:folderId', express.json(), async function updateFolder(request, response) {
     const { name } = request.body ?? {};
     if (typeof name !== 'string' || !name.trim() || Object.keys(request.body).length !== 1) {

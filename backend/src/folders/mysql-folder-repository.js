@@ -1,3 +1,5 @@
+const { randomBytes, randomUUID } = require('node:crypto');
+
 const memberFoldersQuery = `
   SELECT f.folder_id AS folderId, f.folder_name AS name, f.episode_ref AS treatmentReference,
          f.updated_at AS updatedAt, m.role, m.status
@@ -14,6 +16,74 @@ function createMysqlFolderRepository(pool) {
   const findFolderQuery = memberFoldersQuery + ' AND f.folder_id = ?';
 
   return {
+    async createPolicyContext(ownerId, folderId, action, target) {
+      const connection = await pool.getConnection();
+      try {
+        await connection.beginTransaction();
+        const [[folder]] = await connection.execute(
+          'SELECT folder_id FROM Treatment_Folder WHERE folder_id = ? FOR UPDATE', [folderId],
+        );
+        const [members] = folder ? await connection.execute(`
+          SELECT CAST(membership_id AS CHAR) AS membershipId, CAST(user_id AS CHAR) AS userId, role
+          FROM Folder_Membership WHERE folder_id = ? AND status = 'ACTIVE' ORDER BY user_id FOR UPDATE
+        `, [folderId]) : [[]];
+        const owner = members.find((member) => member.userId === String(ownerId) && member.role === 'OWNER');
+        if (!owner) {
+          await connection.rollback();
+          return { code: 'FORBIDDEN' };
+        }
+        const [[policy]] = await connection.execute(
+          'SELECT MAX(policy_version) AS version FROM Folder_Policy WHERE folder_id = ?', [folderId],
+        );
+        const expectedPolicyVersion = Number(policy.version);
+        if (!expectedPolicyVersion || expectedPolicyVersion === 4294967295) {
+          await connection.rollback();
+          return { code: 'POLICY_NOT_READY' };
+        }
+
+        const member = members.find((entry) => entry.membershipId === target.membershipId);
+        const proposedMembers = members.map(({ userId, role }) => ({ userId, role }));
+        if (action === 'ADD_MEMBER') {
+          if (members.some((entry) => entry.userId === target.userId)) {
+            await connection.rollback();
+            return { code: 'MEMBER_ALREADY_ACTIVE' };
+          }
+          proposedMembers.push({ userId: target.userId, role: target.role });
+        } else {
+          if (!member || member.role === 'OWNER' || member.role === target.role) {
+            await connection.rollback();
+            return { code: 'INVALID_MEMBERSHIP_CHANGE' };
+          }
+          const index = proposedMembers.findIndex((entry) => entry.userId === member.userId);
+          if (action === 'CHANGE_ROLE') proposedMembers[index].role = target.role;
+          else proposedMembers.splice(index, 1);
+        }
+
+        const context = {
+          contextId: randomUUID(),
+          folderId,
+          ownerId: owner.userId,
+          action,
+          target,
+          expectedPolicyVersion,
+          nonce: randomBytes(16).toString('hex'),
+          expiresAt: new Date(Date.now() + 5 * 60 * 1000).toISOString(),
+          proposedPolicy: { policyVersion: expectedPolicyVersion + 1, members: proposedMembers },
+        };
+        await connection.execute(
+          'INSERT INTO Folder_Policy_Context (context_id, folder_id, owner_membership_id, payload, expires_at) VALUES (?, ?, ?, ?, ?)',
+          [context.contextId, folderId, owner.membershipId, JSON.stringify(context), context.expiresAt.slice(0, -1).replace('T', ' ')],
+        );
+        await connection.commit();
+        return context;
+      } catch (error) {
+        await connection.rollback();
+        throw error;
+      } finally {
+        connection.release();
+      }
+    },
+
     async createForOwner({ folder, ownerId, signedPolicy, verifyInitialFolderPolicy }) {
       const connection = await pool.getConnection();
       try {

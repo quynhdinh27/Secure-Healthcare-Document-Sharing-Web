@@ -106,3 +106,39 @@ test('create folder rejects an unverified policy and saves a verified folder for
   assert.deepEqual(await created.json(), { folderId, name: 'First folder', role: 'OWNER', policyVersion: 1 });
   assert.deepEqual(events, ['begin', 'folder', 'owner', 'policy', 'commit', 'release']);
 });
+
+test('policy context snapshots a revocation without changing membership', async () => {
+  const statements = [];
+  const members = [
+    { membershipId: '1', userId: '10', role: 'OWNER' },
+    { membershipId: '2', userId: '20', role: 'EDITOR' },
+  ];
+  const connection = {
+    async beginTransaction() {},
+    async execute(sql, parameters) {
+      statements.push(sql.trim());
+      if (sql.includes('FROM Treatment_Folder')) return [[{ folder_id: 'A' }]];
+      if (sql.includes('FROM Folder_Membership')) return [members];
+      if (sql.includes('MAX(policy_version)')) return [[{ version: 1 }]];
+      assert.match(sql, /^INSERT INTO Folder_Policy_Context/);
+      assert.equal(parameters[2], '1');
+      assert.deepEqual(JSON.parse(parameters[3]).proposedPolicy, {
+        policyVersion: 2,
+        members: [{ userId: '10', role: 'OWNER' }],
+      });
+    },
+    async commit() {},
+    async rollback() {},
+    release() {},
+  };
+  const repository = createMysqlFolderRepository({ async getConnection() { return connection; } });
+  const target = { membershipId: '2' };
+  assert.deepEqual(await repository.createPolicyContext('20', 'A', 'REVOKE_MEMBER', target), { code: 'FORBIDDEN' });
+  assert.equal(statements.length, 2);
+  const result = await repository.createPolicyContext('10', 'A', 'REVOKE_MEMBER', target);
+  assert.equal(result.expectedPolicyVersion, 1);
+  assert.equal(result.action, 'REVOKE_MEMBER');
+  assert.match(result.nonce, /^[0-9a-f]{32}$/);
+  assert.equal(members.length, 2);
+  assert.equal(statements.filter((sql) => sql.startsWith('INSERT')).length, 1);
+});
