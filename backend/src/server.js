@@ -38,6 +38,16 @@ function createApp({ authenticate, mysqlPool, folderRepository } = {}) {
   });
   const repository = folderRepository ?? (mysqlPool && createMysqlFolderRepository(mysqlPool));
   app.use('/api/v1/folders', createFolderRouter({ authenticate, folderRepository: repository }));
+  const dashboard = express.Router();
+  if (authenticate) dashboard.use(authenticate);
+  dashboard.get('/summary', async function getDashboardSummary(request, response) {
+    if (!request.user?.id) return response.status(401).json({ code: 'UNAUTHENTICATED' });
+    if (typeof repository?.getDashboardSummary !== 'function') {
+      return response.status(503).json({ code: 'FOLDER_SERVICE_UNAVAILABLE' });
+    }
+    response.json(await repository.getDashboardSummary(request.user.id));
+  });
+  app.use('/api/v1/dashboard', dashboard);
   app.use((error, _request, response, next) => {
     if (response.headersSent) return next(error);
     if (error.type === 'entity.parse.failed') {

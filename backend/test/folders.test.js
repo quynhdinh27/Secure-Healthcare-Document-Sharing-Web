@@ -30,6 +30,14 @@ test('folder endpoints use authenticated identity and expose only active members
         assert.equal(userId, 'binh');
         return [active, revoked].find(({ folder }) => folder.folderId === folderId);
       },
+      async listMembersForUser(userId, folderId) {
+        assert.equal(userId, 'binh');
+        return folderId === 'A' ? [{ membershipId: 1, userId, role: 'VIEWER' }] : null;
+      },
+      async getDashboardSummary(userId) {
+        assert.equal(userId, 'binh');
+        return { folderCount: 1, documentCount: 2, recentFolders: [{ folderId: 'A', role: 'VIEWER' }] };
+      },
     },
   });
   const server = app.listen(0, '127.0.0.1');
@@ -52,6 +60,19 @@ test('folder endpoints use authenticated identity and expose only active members
   for (const id of ['B', 'C']) {
     assert.equal((await fetch(base + '/api/v1/folders/' + id, { headers })).status, 403);
   }
+
+  const members = await fetch(base + '/api/v1/folders/A/members', { headers });
+  assert.equal(members.status, 200);
+  assert.deepEqual(await members.json(), { members: [{ membershipId: 1, userId: 'binh', role: 'VIEWER' }] });
+  assert.equal((await fetch(base + '/api/v1/folders/B/members', { headers })).status, 403);
+
+  const dashboardUrl = base + '/api/v1/dashboard/summary';
+  assert.equal((await fetch(dashboardUrl + '?userId=binh')).status, 401);
+  const dashboard = await fetch(dashboardUrl, { headers });
+  assert.equal(dashboard.status, 200);
+  assert.deepEqual(await dashboard.json(), {
+    folderCount: 1, documentCount: 2, recentFolders: [{ folderId: 'A', role: 'VIEWER' }],
+  });
 });
 
 test('folder rename updates the name only for active owners and editors', async (t) => {
