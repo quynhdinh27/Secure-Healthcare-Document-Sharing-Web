@@ -63,6 +63,24 @@ function createApp({
     response.json(await repository.getDashboardSummary(request.user.id));
   });
   app.use('/api/v1/dashboard', dashboard);
+  const rotations = express.Router();
+  if (authenticate) rotations.use(authenticate);
+  rotations.get('/:rotationId', async function getRotation(request, response) {
+    response.set('Cache-Control', 'no-store');
+    if (!request.user?.id) return response.status(401).json({ code: 'UNAUTHENTICATED' });
+    const { rotationId } = request.params;
+    if (!/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(rotationId)) {
+      return response.status(400).json({ code: 'INVALID_ROTATION_ID' });
+    }
+    if (typeof repository?.findRotationForUser !== 'function') {
+      return response.status(503).json({ code: 'FOLDER_SERVICE_UNAVAILABLE' });
+    }
+    const rotation = await repository.findRotationForUser(request.user.id, rotationId);
+    if (!rotation) return response.status(404).json({ code: 'ROTATION_NOT_FOUND' });
+    response.json(rotation);
+  });
+  app.use('/api/v1/key-rotations', rotations);
+
   app.use((error, _request, response, next) => {
     if (response.headersSent) return next(error);
     if (error.type === 'entity.parse.failed') {

@@ -75,6 +75,41 @@ test('folder endpoints use authenticated identity and expose only active members
   });
 });
 
+test('rotation status is available only to active owners and editors of the folder', async (t) => {
+  const rotationId = 'abc12345-1234-1234-1234-123456789abc';
+  const rotation = { rotationId, folderId: 'A', policyVersion: 2, status: 'PENDING' };
+  const app = createApp({
+    authenticate(request, _response, next) {
+      const userId = request.get('authorization');
+      if (userId) request.user = { id: userId };
+      next();
+    },
+    mysqlPool: {
+      async execute(sql, [id, userId]) {
+        assert.match(sql, /m\.folder_id = j\.folder_id/);
+        assert.match(sql, /m\.status = 'ACTIVE' AND m\.role IN \('OWNER', 'EDITOR'\)/);
+        return [id === rotationId && ['owner', 'editor'].includes(userId) ? [rotation] : []];
+      },
+    },
+  });
+  const server = app.listen(0, '127.0.0.1');
+  t.after(() => server.close());
+  await once(server, 'listening');
+  const url = `http://127.0.0.1:${server.address().port}/api/v1/key-rotations/${rotationId}`;
+
+  assert.equal((await fetch(url)).status, 401);
+  for (const authorization of ['owner', 'editor']) {
+    const result = await fetch(url, { headers: { authorization } });
+    assert.equal(result.status, 200);
+    assert.equal(result.headers.get('cache-control'), 'no-store');
+    assert.deepEqual(await result.json(), rotation);
+  }
+  for (const authorization of ['viewer', 'revoked', 'outsider']) {
+    assert.equal((await fetch(url, { headers: { authorization } })).status, 404);
+  }
+  assert.equal((await fetch(url + 'invalid', { headers: { authorization: 'owner' } })).status, 400);
+});
+
 test('folder rename updates the name only for active owners and editors', async (t) => {
   const folder = { folderId: 'A', name: 'Original' };
   const memberships = {
