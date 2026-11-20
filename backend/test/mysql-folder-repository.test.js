@@ -1,6 +1,7 @@
 const assert = require('node:assert/strict');
 const { test } = require('node:test');
 const { createMysqlFolderRepository } = require('../src/folders/mysql-folder-repository');
+const { queueMysqlFolderRotation } = require('../src/folders/mysql-folder-rotation-queue');
 
 test('rename checks the current membership under lock before issuing a write', async () => {
   const calls = [];
@@ -150,6 +151,8 @@ test('member revocation commits policy and rotation together and rolls back if r
     expectedPolicyVersion: 1, proposedPolicy: { policyVersion: 2 },
   };
   let expired = false;
+  let failRotation = false;
+  let rotationId;
   const connection = {
     async beginTransaction() { events.push('begin'); },
     async execute(sql, args) {
@@ -162,6 +165,17 @@ test('member revocation commits policy and rotation together and rolls back if r
         events.push('revoke');
       } else if (sql.includes('INSERT INTO Folder_Policy')) events.push('save policy');
       else if (sql.includes('UPDATE Folder_Policy_Context')) events.push('consume context');
+      else if (sql.includes('UPDATE Folder_Rotation_Job')) {
+        assert.match(sql, /status = 'CANCELLED'/);
+        assert.deepEqual(args, ['A']);
+        events.push('cancel old jobs');
+      } else if (sql.includes('INSERT INTO Folder_Rotation_Job')) {
+        [rotationId] = args;
+        assert.match(rotationId, /^[0-9a-f-]{36}$/);
+        assert.deepEqual(args.slice(1), ['A', 2, '7', 'REVOKE_MEMBER']);
+        events.push('queue new job');
+        if (failRotation) throw new Error('queue failed');
+      }
       else assert.fail('Unexpected SQL: ' + sql);
       return [{ affectedRows: 1 }];
     },
@@ -170,7 +184,6 @@ test('member revocation commits policy and rotation together and rolls back if r
     release() { events.push('release'); },
   };
   const repository = createMysqlFolderRepository({ async getConnection() { return connection; } });
-  let failRotation = false;
   const input = {
     ownerId: '7', folderId: 'A', membershipId: '2', action: 'REVOKE_MEMBER',
     policyContextId: 'context', ownerSignature: 'fixture',
@@ -179,22 +192,18 @@ test('member revocation commits policy and rotation together and rolls back if r
       events.push('verify');
       return true;
     },
-    async queueFolderRotation({ connection: transaction, policyVersion }) {
-      assert.equal(transaction, connection);
-      assert.equal(policyVersion, 2);
-      events.push('rotation');
-      if (failRotation) throw new Error('queue failed');
-      return 'rotation-1';
-    },
+    queueFolderRotation: queueMysqlFolderRotation,
   };
 
-  assert.deepEqual(await repository.applyMemberChange(input), { policyVersion: 2, rotationId: 'rotation-1' });
-  assert.deepEqual(events, ['begin', 'verify', 'revoke', 'save policy', 'consume context', 'rotation', 'commit', 'release']);
+  const writes = ['begin', 'verify', 'revoke', 'save policy', 'consume context', 'cancel old jobs', 'queue new job'];
+  const result = await repository.applyMemberChange(input);
+  assert.deepEqual(result, { policyVersion: 2, rotationId });
+  assert.deepEqual(events, [...writes, 'commit', 'release']);
 
   events.length = 0;
   failRotation = true;
   await assert.rejects(repository.applyMemberChange(input), /queue failed/);
-  assert.deepEqual(events, ['begin', 'verify', 'revoke', 'save policy', 'consume context', 'rotation', 'rollback', 'release']);
+  assert.deepEqual(events, [...writes, 'rollback', 'release']);
 
   events.length = 0;
   expired = true;

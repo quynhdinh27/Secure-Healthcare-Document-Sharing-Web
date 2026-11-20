@@ -2,6 +2,7 @@ const express = require('express');
 const { createFolderRouter } = require('./folders/folder-router');
 const { createMysqlFolderRepository } = require('./folders/mysql-folder-repository');
 const { createFolderPolicyVerifiers } = require('./folders/folder-policy-signatures');
+const { queueMysqlFolderRotation } = require('./folders/mysql-folder-rotation-queue');
 
 function createApp({
   authenticate, mysqlPool, folderRepository, folderPolicyKeys,
@@ -50,7 +51,7 @@ function createApp({
     folderRepository: repository,
     verifyInitialFolderPolicy: verifyInitialFolderPolicy ?? policyVerifiers.verifyInitialFolderPolicy,
     verifyFolderPolicy: verifyFolderPolicy ?? policyVerifiers.verifyFolderPolicy,
-    queueFolderRotation,
+    queueFolderRotation: queueFolderRotation ?? (mysqlPool && !folderRepository ? queueMysqlFolderRotation : undefined),
   }));
   const dashboard = express.Router();
   if (authenticate) dashboard.use(authenticate);
