@@ -67,9 +67,26 @@ function createApp({
   app.use('/api/v1/dashboard', dashboard);
   const rotations = express.Router();
   if (authenticate) rotations.use(authenticate);
-  rotations.use('/:rotationId', (request, response, next) => {
+  rotations.use((request, response, next) => {
     response.set('Cache-Control', 'no-store');
     if (!request.user?.id) return response.status(401).json({ code: 'UNAUTHENTICATED' });
+    next();
+  });
+  rotations.get('/', async function listRotations(request, response) {
+    const page = request.query.page ?? '1';
+    if (typeof page !== 'string' || !/^[1-9][0-9]{0,8}$/.test(page)) {
+      return response.status(400).json({ code: 'INVALID_ROTATION_PAGE' });
+    }
+    if (typeof repository?.listRotationsForUser !== 'function') {
+      return response.status(503).json({ code: 'ROTATION_SERVICE_UNAVAILABLE' });
+    }
+    const { rotations: jobs, nextPage } = await repository.listRotationsForUser(request.user.id, Number(page));
+    response.json({
+      rotations: typeof canReadRotationSources === 'function' ? jobs : jobs.map((job) => ({ ...job, canClaim: false })),
+      nextPage,
+    });
+  });
+  rotations.use('/:rotationId', (request, response, next) => {
     const { rotationId } = request.params;
     if (!/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(rotationId)) {
       return response.status(400).json({ code: 'INVALID_ROTATION_ID' });

@@ -9,6 +9,17 @@ const memberFoldersQuery = `
   WHERE m.user_id = ? AND m.status = 'ACTIVE'
 `;
 
+const rotationJobColumns = `
+  j.rotation_id AS rotationId, j.folder_id AS folderId,
+  j.policy_version AS policyVersion, j.action, j.status,
+  j.created_at AS createdAt, j.finished_at AS finishedAt
+`;
+
+const rotationJobMembership = `
+  FROM Folder_Rotation_Job AS j
+  INNER JOIN Folder_Membership AS m ON m.folder_id = j.folder_id
+`;
+
 function toEntry({ role, status, ...folder }) {
   return { folder, membership: { role, status } };
 }
@@ -452,15 +463,35 @@ function createMysqlFolderRepository(pool) {
 
     async findRotationForUser(userId, rotationId) {
       const [[job]] = await pool.execute(`
-        SELECT j.rotation_id AS rotationId, j.folder_id AS folderId,
-               j.policy_version AS policyVersion, j.action, j.status,
-               j.created_at AS createdAt, j.finished_at AS finishedAt
-        FROM Folder_Rotation_Job AS j
-        INNER JOIN Folder_Membership AS m ON m.folder_id = j.folder_id
+        SELECT ${rotationJobColumns}
+        ${rotationJobMembership}
         WHERE j.rotation_id = ? AND m.user_id = ?
           AND m.status = 'ACTIVE' AND m.role IN ('OWNER', 'EDITOR')
       `, [rotationId, userId]);
       return job ?? null;
+    },
+
+    async listRotationsForUser(userId, page) {
+      const pageSize = 50;
+      const [jobs] = await pool.query(`
+        SELECT ${rotationJobColumns},
+               CASE WHEN j.status IN ('PENDING', 'WAITING_FOR_CLIENT')
+                      OR (j.status = 'IN_PROGRESS' AND
+                          (j.executor_id = m.user_id OR j.lease_expires_at IS NULL
+                           OR j.lease_expires_at <= UTC_TIMESTAMP(3)))
+                    THEN 1 ELSE 0 END AS canAttemptClaim
+        ${rotationJobMembership}
+        WHERE m.user_id = ? AND m.status = 'ACTIVE' AND m.role IN ('OWNER', 'EDITOR')
+        ORDER BY j.created_at DESC, j.rotation_id DESC
+        LIMIT ? OFFSET ?
+      `, [userId, pageSize + 1, (page - 1) * pageSize]);
+      return {
+        rotations: jobs.slice(0, pageSize).map(({ canAttemptClaim, ...job }) => ({
+          ...job,
+          canClaim: Number(canAttemptClaim) === 1 ? null : false,
+        })),
+        nextPage: jobs.length > pageSize ? page + 1 : null,
+      };
     },
 
     claimRotationForUser(userId, rotationId, canReadRotationSources) {
