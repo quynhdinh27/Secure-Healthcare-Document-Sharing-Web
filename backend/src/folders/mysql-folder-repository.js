@@ -79,6 +79,55 @@ async function commitMemberChange(connection, input) {
   return { policyVersion, rotationId };
 }
 
+async function claimRotation(connection, userId, rotationId, canReadRotationSources) {
+  const [[location]] = await connection.execute(
+    'SELECT folder_id AS folderId FROM Folder_Rotation_Job WHERE rotation_id = ?', [rotationId],
+  );
+  if (!location) return { code: 'ROTATION_NOT_FOUND' };
+
+  // Use the same lock order as membership changes and job cancellation.
+  await connection.execute('SELECT folder_id FROM Treatment_Folder WHERE folder_id = ? FOR UPDATE', [location.folderId]);
+  const [[job]] = await connection.execute(`
+    SELECT j.folder_id AS folderId, j.policy_version AS policyVersion, j.status, j.generation,
+           CAST(j.executor_id AS CHAR) AS executorId,
+           j.lease_expires_at > UTC_TIMESTAMP(3) AS leaseActive,
+           DATE_FORMAT(j.lease_expires_at, '%Y-%m-%dT%H:%i:%s.%fZ') AS leaseExpiresAt
+    FROM Folder_Rotation_Job AS j
+    INNER JOIN Folder_Membership AS m ON m.folder_id = j.folder_id
+    WHERE j.rotation_id = ? AND m.user_id = ?
+      AND m.status = 'ACTIVE' AND m.role IN ('OWNER', 'EDITOR')
+    FOR UPDATE
+  `, [rotationId, userId]);
+  if (!job) return { code: 'ROTATION_NOT_FOUND' };
+  if (!['PENDING', 'WAITING_FOR_CLIENT', 'IN_PROGRESS'].includes(job.status)) {
+    return { code: 'ROTATION_NOT_CLAIMABLE' };
+  }
+
+  const leaseActive = job.status === 'IN_PROGRESS' && Number(job.leaseActive) === 1;
+  if (leaseActive && job.executorId !== String(userId)) return { code: 'ROTATION_ALREADY_CLAIMED' };
+
+  // The source checker performs server-side checks using current reads on this connection.
+  if (await canReadRotationSources({ connection, userId, rotationId, folderId: job.folderId, policyVersion: job.policyVersion }) !== true) {
+    return { code: 'ROTATION_SOURCE_UNAVAILABLE' };
+  }
+
+  if (leaseActive) {
+    return { rotationId, generation: job.generation, leaseExpiresAt: job.leaseExpiresAt, status: 'IN_PROGRESS' };
+  }
+
+  await connection.execute(`
+    UPDATE Folder_Rotation_Job
+    SET status = 'IN_PROGRESS', executor_id = ?, generation = generation + 1,
+        lease_expires_at = UTC_TIMESTAMP(3) + INTERVAL 5 MINUTE
+    WHERE rotation_id = ?
+  `, [userId, rotationId]);
+  const [[lease]] = await connection.execute(`
+    SELECT generation, DATE_FORMAT(lease_expires_at, '%Y-%m-%dT%H:%i:%s.%fZ') AS leaseExpiresAt
+    FROM Folder_Rotation_Job WHERE rotation_id = ? FOR UPDATE
+  `, [rotationId]);
+  return { rotationId, ...lease, status: 'IN_PROGRESS' };
+}
+
 function createMysqlFolderRepository(pool) {
   const findFolderQuery = memberFoldersQuery + ' AND f.folder_id = ?';
 
@@ -233,6 +282,22 @@ function createMysqlFolderRepository(pool) {
           AND m.status = 'ACTIVE' AND m.role IN ('OWNER', 'EDITOR')
       `, [rotationId, userId]);
       return job ?? null;
+    },
+
+    async claimRotationForUser(userId, rotationId, canReadRotationSources) {
+      const connection = await pool.getConnection();
+      try {
+        await connection.beginTransaction();
+        const result = await claimRotation(connection, userId, rotationId, canReadRotationSources);
+        if (result.code) await connection.rollback();
+        else await connection.commit();
+        return result;
+      } catch (error) {
+        await connection.rollback();
+        throw error;
+      } finally {
+        connection.release();
+      }
     },
 
     async listMembersForUser(userId, folderId) {

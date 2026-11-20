@@ -3,6 +3,63 @@ const { test } = require('node:test');
 const { createMysqlFolderRepository } = require('../src/folders/mysql-folder-repository');
 const { queueMysqlFolderRotation } = require('../src/folders/mysql-folder-rotation-queue');
 
+test('rotation claim locks the folder, checks source access and grants only one active lease', async () => {
+  const leaseExpiresAt = '2026-11-20T08:15:00.000000Z';
+  const job = { folderId: 'A', policyVersion: 2, status: 'PENDING', generation: 0 };
+  const events = [];
+  const connection = {
+    async beginTransaction() { events.push('begin'); },
+    async execute(sql, args) {
+      if (sql.includes('SELECT folder_id AS folderId')) return [[{ folderId: 'A' }]];
+      if (sql.includes('FROM Treatment_Folder')) {
+        assert.match(sql, /FOR UPDATE/);
+        events.push('folder lock');
+        return [[{ folder_id: 'A' }]];
+      }
+      if (sql.includes('INNER JOIN Folder_Membership')) {
+        assert.match(sql, /m\.status = 'ACTIVE' AND m\.role IN \('OWNER', 'EDITOR'\)/);
+        assert.match(sql, /FOR UPDATE/);
+        assert.equal(args[0], 'rotation');
+        return [args[1] === 'viewer' ? [] : [job]];
+      }
+      if (sql.includes('UPDATE Folder_Rotation_Job')) {
+        assert.match(sql, /INTERVAL 5 MINUTE/);
+        events.push('lease write');
+        Object.assign(job, {
+          executorId: args[0], status: 'IN_PROGRESS', generation: job.generation + 1,
+          leaseActive: 1, leaseExpiresAt,
+        });
+        return [{ affectedRows: 1 }];
+      }
+      assert.match(sql, /SELECT generation/);
+      return [[{ generation: job.generation, leaseExpiresAt }]];
+    },
+    async commit() { events.push('commit'); },
+    async rollback() { events.push('rollback'); },
+    release() { events.push('release'); },
+  };
+  const repository = createMysqlFolderRepository({ async getConnection() { return connection; } });
+  const claim = (userId, eligible = true) => repository.claimRotationForUser(userId, 'rotation', async (source) => {
+    assert.deepEqual(source, { connection, userId, rotationId: 'rotation', folderId: 'A', policyVersion: 2 });
+    events.push('source check');
+    return eligible;
+  });
+
+  assert.deepEqual(await claim('viewer'), { code: 'ROTATION_NOT_FOUND' });
+  assert.deepEqual(await claim('editor', false), { code: 'ROTATION_SOURCE_UNAVAILABLE' });
+  assert.equal(job.generation, 0);
+  events.length = 0;
+  const first = await claim('editor');
+  assert.deepEqual(first, { rotationId: 'rotation', status: 'IN_PROGRESS', generation: 1, leaseExpiresAt });
+  assert.deepEqual(events, ['begin', 'folder lock', 'source check', 'lease write', 'commit', 'release']);
+  assert.deepEqual(await claim('editor'), first);
+  assert.deepEqual(await claim('owner'), { code: 'ROTATION_ALREADY_CLAIMED' });
+  job.leaseActive = 0;
+  assert.deepEqual(await claim('owner'), { ...first, generation: 2 });
+  job.status = 'CANCELLED';
+  assert.deepEqual(await claim('owner'), { code: 'ROTATION_NOT_CLAIMABLE' });
+});
+
 test('rename checks the current membership under lock before issuing a write', async () => {
   const calls = [];
   const connection = {

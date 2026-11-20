@@ -108,6 +108,11 @@ test('rotation status is available only to active owners and editors of the fold
     assert.equal((await fetch(url, { headers: { authorization } })).status, 404);
   }
   assert.equal((await fetch(url + 'invalid', { headers: { authorization: 'owner' } })).status, 400);
+  const claimUrl = url + '/claim';
+  assert.equal((await fetch(claimUrl, { method: 'POST' })).status, 401);
+  const claim = await fetch(claimUrl, { method: 'POST', headers: { authorization: 'owner' } });
+  assert.equal(claim.status, 503);
+  assert.deepEqual(await claim.json(), { code: 'ROTATION_SERVICE_UNAVAILABLE' });
 });
 
 test('folder rename updates the name only for active owners and editors', async (t) => {
