@@ -61,6 +61,7 @@ function createFolderRouter({
   });
 
   router.get('/:folderId', async function getFolder(request, response) {
+    response.set('Cache-Control', 'no-store');
     const entry = await folderRepository.findForUser(request.user.id, request.params.folderId);
     if (!hasFolderPermission(entry?.membership, 'read')) {
       return response.status(403).json({ code: 'FORBIDDEN' });
