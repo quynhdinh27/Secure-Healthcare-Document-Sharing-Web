@@ -101,9 +101,19 @@ function createFolderRouter({
   });
 
   router.patch('/:folderId', express.json(), async function updateFolder(request, response) {
-    const { name } = request.body ?? {};
-    if (typeof name !== 'string' || !name.trim() || Object.keys(request.body).length !== 1) {
+    const body = request.body ?? {};
+    const fields = Object.keys(body);
+    const { name, description } = body;
+    if (!fields.length || fields.some((field) => field !== 'name' && field !== 'description')) {
       return response.status(400).json({ code: 'INVALID_FOLDER_NAME' });
+    }
+    if (Object.hasOwn(body, 'name') && (typeof name !== 'string' || !name.trim() || Array.from(name.trim()).length > 255)) {
+      return response.status(400).json({ code: 'INVALID_FOLDER_NAME' });
+    }
+    const editsDescription = Object.hasOwn(body, 'description');
+    if (editsDescription && description !== null
+        && (typeof description !== 'string' || Array.from(description.trim()).length > 1000)) {
+      return response.status(400).json({ code: 'INVALID_FOLDER_DESCRIPTION' });
     }
 
     const userId = request.user.id;
@@ -112,14 +122,16 @@ function createFolderRouter({
     if (!hasFolderPermission(entry?.membership, 'renameFolder')) {
       return response.status(403).json({ code: 'FORBIDDEN' });
     }
-    if (typeof folderRepository.renameForUser !== 'function') {
+    const method = editsDescription ? 'updateForUser' : 'renameForUser';
+    if (typeof folderRepository[method] !== 'function') {
       return response.status(503).json({ code: 'FOLDER_SERVICE_UNAVAILABLE' });
     }
 
     // The repository must check active membership and role in the same operation as the write.
-    const updated = await folderRepository.renameForUser(
-      userId, folderId, name.trim(), [...rolesByAction.renameFolder],
-    );
+    const change = editsDescription
+      ? { name: name?.trim(), description: description?.trim() || null }
+      : name.trim();
+    const updated = await folderRepository[method](userId, folderId, change, [...rolesByAction.renameFolder]);
     if (!updated) {
       return response.status(403).json({ code: 'FORBIDDEN' });
     }
