@@ -1,9 +1,11 @@
 const express = require('express');
 const { createFolderRouter } = require('./folders/folder-router');
 const { createMysqlFolderRepository } = require('./folders/mysql-folder-repository');
+const { createFolderPolicyVerifiers } = require('./folders/folder-policy-signatures');
 
 function createApp({
-  authenticate, mysqlPool, folderRepository, verifyInitialFolderPolicy, verifyFolderPolicy, queueFolderRotation,
+  authenticate, mysqlPool, folderRepository, folderPolicyKeys,
+  verifyInitialFolderPolicy, verifyFolderPolicy, queueFolderRotation,
 } = {}) {
   const app = express();
 
@@ -39,8 +41,16 @@ function createApp({
     `);
   });
   const repository = folderRepository ?? (mysqlPool && createMysqlFolderRepository(mysqlPool));
+  const policyVerifiers = typeof folderPolicyKeys?.lookupActiveSigningKey === 'function'
+    && typeof folderPolicyKeys?.canReceiveFolderKeys === 'function'
+    ? createFolderPolicyVerifiers(folderPolicyKeys)
+    : {};
   app.use('/api/v1/folders', createFolderRouter({
-    authenticate, folderRepository: repository, verifyInitialFolderPolicy, verifyFolderPolicy, queueFolderRotation,
+    authenticate,
+    folderRepository: repository,
+    verifyInitialFolderPolicy: verifyInitialFolderPolicy ?? policyVerifiers.verifyInitialFolderPolicy,
+    verifyFolderPolicy: verifyFolderPolicy ?? policyVerifiers.verifyFolderPolicy,
+    queueFolderRotation,
   }));
   const dashboard = express.Router();
   if (authenticate) dashboard.use(authenticate);
