@@ -3,6 +3,31 @@ const { test } = require('node:test');
 const { createMysqlFolderRepository } = require('../src/folders/mysql-folder-repository');
 const { queueMysqlFolderRotation } = require('../src/folders/mysql-folder-rotation-queue');
 
+test('folder deletion rolls back if rotation cancellation fails', async () => {
+  const events = [];
+  const connection = {
+    async beginTransaction() { events.push('begin'); },
+    async execute(sql) {
+      if (sql.includes('FROM Treatment_Folder')) return [[{ folder_id: 'A' }]];
+      if (sql.includes('FROM Folder_Deletion_Operation')) return [[]];
+      if (sql.includes('FROM Folder_Membership')) return [[{ membership_id: 1 }]];
+      if (sql.includes('INSERT INTO Folder_Deletion_Operation')) events.push('queue cleanup');
+      else if (sql.includes('UPDATE Folder_Membership')) events.push('revoke access');
+      else {
+        assert.match(sql, /UPDATE Folder_Rotation_Job/);
+        throw new Error('cancellation failed');
+      }
+      return [{ affectedRows: 1 }];
+    },
+    async commit() { events.push('commit'); },
+    async rollback() { events.push('rollback'); },
+    release() { events.push('release'); },
+  };
+  const repository = createMysqlFolderRepository({ async getConnection() { return connection; } });
+  await assert.rejects(repository.deleteForOwner('7', 'A'), /cancellation failed/);
+  assert.deepEqual(events, ['begin', 'queue cleanup', 'revoke access', 'rollback', 'release']);
+});
+
 test('rotation claim and renewal enforce current membership, source access and lease ownership', async () => {
   const leaseExpiresAt = '2026-11-20T08:15:00.000000Z';
   const renewedUntil = '2026-11-20T08:17:00.000000Z';

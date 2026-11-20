@@ -157,6 +157,97 @@ test('folder details and signed policy history use current folder membership', a
   }
 });
 
+test('folder deletion requires owner reauthentication and exposes cleanup progress to that owner', async (t) => {
+  const folderId = 'abc12345-1234-1234-1234-123456789abc';
+  const roles = { owner: 'OWNER', editor: 'EDITOR' };
+  let operation;
+  let cancelled = false;
+  const connection = {
+    async beginTransaction() {},
+    async commit() {},
+    async rollback() {},
+    release() {},
+    async execute(sql, args) {
+      if (sql.includes('FROM Treatment_Folder')) {
+        assert.match(sql, /FOR UPDATE/);
+        return [[{ folder_id: folderId }]];
+      }
+      if (sql.includes('FROM Folder_Deletion_Operation')) {
+        assert.deepEqual(args.slice(0, 1), [folderId]);
+        return [operation && args[1] === 'owner' ? [operation] : []];
+      }
+      if (sql.includes('FROM Folder_Membership')) {
+        assert.match(sql, /role = 'OWNER' AND status = 'ACTIVE'/);
+        return [roles[args[1]] === 'OWNER' ? [{ membership_id: 1 }] : []];
+      }
+      if (sql.includes('INSERT INTO Folder_Deletion_Operation')) {
+        assert.deepEqual(args.slice(1), [folderId, 'owner']);
+        assert.equal(operation, undefined);
+        operation = { operationId: args[0], status: 'PENDING' };
+      } else if (sql.includes('UPDATE Folder_Membership')) {
+        assert.deepEqual(args, ['owner', folderId]);
+        assert.match(sql, /status = 'REVOKED'/);
+        delete roles.owner;
+        delete roles.editor;
+      } else {
+        assert.match(sql, /UPDATE Folder_Rotation_Job SET status = 'CANCELLED'/);
+        assert.deepEqual(args, [folderId]);
+        cancelled = true;
+      }
+      return [{ affectedRows: 1 }];
+    },
+  };
+  const app = createApp({
+    authenticate(request, _response, next) {
+      const id = request.get('authorization');
+      if (id) request.user = { id };
+      next();
+    },
+    async verifyFolderDeletionReauth(request) {
+      return request.get('x-test-reauth') === request.user.id;
+    },
+    mysqlPool: {
+      async getConnection() { return connection; },
+      async execute(sql, [id, userId]) {
+        if (sql.includes('FROM Folder_Deletion_Operation')) {
+          assert.match(sql, /requested_by = \?/);
+          return [id === operation?.operationId && userId === 'owner' ? [{ ...operation, folderId }] : []];
+        }
+        assert.match(sql, /m\.status = 'ACTIVE'/);
+        return [roles[id] ? [{ folderId, role: roles[id], status: 'ACTIVE' }] : []];
+      },
+    },
+  });
+  const server = app.listen(0, '127.0.0.1');
+  t.after(() => server.close());
+  await once(server, 'listening');
+  const base = `http://127.0.0.1:${server.address().port}/api/v1`;
+  const url = base + '/folders/' + folderId;
+  const remove = (id, reauthenticated = true) => fetch(url, {
+    method: 'DELETE', headers: { authorization: id, ...(reauthenticated && { 'x-test-reauth': id }) },
+  });
+
+  assert.equal((await fetch(url, { method: 'DELETE' })).status, 401);
+  const stale = await remove('owner', false);
+  assert.equal(stale.status, 403);
+  assert.deepEqual(await stale.json(), { code: 'REAUTHENTICATION_REQUIRED' });
+  assert.equal((await remove('editor')).status, 403);
+  assert.equal(operation, undefined);
+
+  const accepted = await remove('owner');
+  const location = '/operations/' + operation.operationId;
+  assert.equal(accepted.status, 202);
+  assert.deepEqual(await accepted.json(), operation);
+  assert.equal(accepted.headers.get('location'), '/api/v1' + location);
+  assert.equal(cancelled, true);
+  assert.equal((await fetch(url, { headers: { authorization: 'editor' } })).status, 403);
+  assert.deepEqual(await (await remove('owner')).json(), operation);
+  assert.equal((await fetch(base + location, { headers: { authorization: 'editor' } })).status, 404);
+  assert.deepEqual(await (await fetch(base + location, { headers: { authorization: 'owner' } })).json(), {
+    ...operation, folderId,
+  });
+});
+
 test('rotation status is available only to active owners and editors of the folder', async (t) => {
   const rotationId = 'abc12345-1234-1234-1234-123456789abc';
   const rotation = { rotationId, folderId: 'A', policyVersion: 2, status: 'PENDING' };
