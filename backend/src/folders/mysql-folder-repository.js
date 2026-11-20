@@ -12,6 +12,24 @@ function toEntry({ role, status, ...folder }) {
   return { folder, membership: { role, status } };
 }
 
+function folderCryptoState(rotationStatus, leaseExpired) {
+  switch (rotationStatus) {
+    case 'PENDING':
+      return 'ROTATING';
+    case 'IN_PROGRESS':
+      return Number(leaseExpired) === 1 ? 'WAITING_FOR_CLIENT' : 'ROTATING';
+    case 'WAITING_FOR_CLIENT':
+    case 'WAITING_FOR_KEY':
+    case 'WAITING_FOR_OWNER':
+    case 'FAILED':
+      return rotationStatus;
+    case 'COMPLETED':
+      return 'READY';
+    default:
+      return null;
+  }
+}
+
 async function writeMemberChange(connection, { folderId, ownerId, action, target }) {
   if (action === 'ADD_MEMBER') {
     await connection.execute(
@@ -353,12 +371,20 @@ function createMysqlFolderRepository(pool) {
 
     async findForUser(userId, folderId) {
       const [[row]] = await pool.execute(`
-        SELECT folder.*,
-               (SELECT MAX(p.policy_version) FROM Folder_Policy AS p
-                WHERE p.folder_id = folder.folderId) AS policyVersion
-        FROM (${findFolderQuery}) AS folder
+        SELECT detail.*, j.status AS rotationStatus,
+               COALESCE(j.lease_expires_at <= UTC_TIMESTAMP(3), 1) AS leaseExpired
+        FROM (
+          SELECT folder.*,
+                 (SELECT MAX(p.policy_version) FROM Folder_Policy AS p
+                  WHERE p.folder_id = folder.folderId) AS policyVersion
+          FROM (${findFolderQuery}) AS folder
+        ) AS detail
+        LEFT JOIN Folder_Rotation_Job AS j
+          ON j.folder_id = detail.folderId AND j.policy_version = detail.policyVersion
       `, [userId, folderId]);
-      return row ? toEntry(row) : null;
+      if (!row) return null;
+      const { rotationStatus, leaseExpired, ...detail } = row;
+      return toEntry({ ...detail, cryptoState: folderCryptoState(rotationStatus, leaseExpired) });
     },
 
     async findPolicyForUser(userId, folderId, policyVersion) {

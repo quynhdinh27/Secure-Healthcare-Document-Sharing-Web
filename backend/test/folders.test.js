@@ -78,6 +78,8 @@ test('folder endpoints use authenticated identity and expose only active members
 test('folder details and signed policy history use current folder membership', async (t) => {
   const initial = { payload: { purpose: 'INITIAL_FOLDER_POLICY' }, signature: 'initial-signature' };
   const change = { context: { action: 'ADD_MEMBER' }, ownerSignature: 'member-signature' };
+  let rotationStatus = 'PENDING';
+  let leaseExpired = 0;
   const app = createApp({
     authenticate(request, _response, next) {
       const id = request.get('authorization');
@@ -88,8 +90,14 @@ test('folder details and signed policy history use current folder membership', a
       async execute(sql, args) {
         if (sql.includes('MAX(p.policy_version)')) {
           assert.match(sql, /m\.status = 'ACTIVE'/);
-          assert.deepEqual(args, ['viewer', 'A']);
-          return [[{ folderId: 'A', policyVersion: 2, status: 'ACTIVE', role: 'VIEWER' }]];
+          assert.match(sql, /j\.folder_id = detail\.folderId AND j\.policy_version = detail\.policyVersion/);
+          assert.match(sql, /j\.lease_expires_at <= UTC_TIMESTAMP\(3\)/);
+          const [userId, folderId] = args;
+          assert.equal(folderId, 'A');
+          if (userId !== 'viewer') return [[]];
+          return [[{
+            folderId, policyVersion: 2, status: 'ACTIVE', role: 'VIEWER', rotationStatus, leaseExpired,
+          }]];
         }
         assert.match(sql, /p\.folder_id = m\.folder_id AND p\.policy_version = \?/);
         assert.match(sql, /m\.user_id = \? AND m\.status = 'ACTIVE'/);
@@ -109,8 +117,27 @@ test('folder details and signed policy history use current folder membership', a
   await once(server, 'listening');
   const folderUrl = `http://127.0.0.1:${server.address().port}/api/v1/folders/A`;
   const headers = { authorization: 'viewer' };
-  const details = await fetch(folderUrl, { headers });
-  assert.deepEqual(await details.json(), { folderId: 'A', policyVersion: 2, role: 'VIEWER' });
+  const states = [
+    ['PENDING', 1, 'ROTATING'],
+    ['IN_PROGRESS', 0, 'ROTATING'],
+    ['IN_PROGRESS', 1, 'WAITING_FOR_CLIENT'],
+    ['WAITING_FOR_CLIENT', 1, 'WAITING_FOR_CLIENT'],
+    ['WAITING_FOR_KEY', 1, 'WAITING_FOR_KEY'],
+    ['WAITING_FOR_OWNER', 1, 'WAITING_FOR_OWNER'],
+    ['FAILED', 1, 'FAILED'],
+    ['COMPLETED', 1, 'READY'],
+    ['CANCELLED', 1, null],
+    [null, 1, null],
+  ];
+  for (const [status, expired, cryptoState] of states) {
+    rotationStatus = status;
+    leaseExpired = expired;
+    const details = await fetch(folderUrl, { headers });
+    assert.equal(details.status, 200);
+    assert.equal(details.headers.get('cache-control'), 'no-store');
+    assert.deepEqual(await details.json(), { folderId: 'A', policyVersion: 2, role: 'VIEWER', cryptoState });
+  }
+  assert.equal((await fetch(folderUrl, { headers: { authorization: 'revoked' } })).status, 403);
 
   const policiesUrl = folderUrl + '/policies/';
   for (const [version, signedPolicy] of [[1, initial], [2, change]]) {
