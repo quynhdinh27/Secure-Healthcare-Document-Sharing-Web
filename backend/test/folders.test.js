@@ -115,7 +115,7 @@ test('rotation status is available only to active owners and editors of the fold
   assert.deepEqual(await claim.json(), { code: 'ROTATION_SERVICE_UNAVAILABLE' });
 });
 
-test('folder rename updates the name only for active owners and editors', async (t) => {
+test('folder updates allow active owners and editors to change the name and description', async (t) => {
   const folder = { folderId: 'A', name: 'Original' };
   const memberships = {
     owner: { status: 'ACTIVE', role: 'OWNER' },
@@ -142,6 +142,14 @@ test('folder rename updates the name only for active owners and editors', async 
         assert.ok(allowedRoles.includes(membership.role));
         if (membership.status !== 'ACTIVE') return null;
         folder.name = name;
+        return { folder, membership };
+      },
+      async updateForUser(userId, folderId, change, allowedRoles) {
+        assert.equal(folderId, folder.folderId);
+        const membership = memberships[userId];
+        assert.ok(allowedRoles.includes(membership.role));
+        if (change.name !== undefined) folder.name = change.name;
+        folder.description = change.description;
         return { folder, membership };
       },
     },
@@ -174,4 +182,14 @@ test('folder rename updates the name only for active owners and editors', async 
     assert.equal((await rename('editor', body)).status, 400);
   }
   assert.equal(folder.name, 'editor');
+
+  assert.equal((await rename('viewer', '{"description":"Denied"}')).status, 403);
+  assert.equal((await rename('editor', '{"description":42}')).status, 400);
+  assert.equal((await rename('editor', JSON.stringify({ description: 'a'.repeat(1001) }))).status, 400);
+  const edited = await rename('editor', '{"description":"  Follow up  "}');
+  assert.equal(edited.status, 200);
+  assert.deepEqual(await edited.json(), { folderId: 'A', name: 'editor', description: 'Follow up', role: 'EDITOR' });
+  const cleared = await rename('owner', '{"name":"New name","description":null}');
+  assert.equal(cleared.status, 200);
+  assert.deepEqual(await cleared.json(), { folderId: 'A', name: 'New name', description: null, role: 'OWNER' });
 });

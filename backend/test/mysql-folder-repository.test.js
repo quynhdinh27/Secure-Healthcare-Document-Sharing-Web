@@ -122,6 +122,34 @@ test('rename rolls back and releases the connection if the update fails', async 
   assert.deepEqual(calls, ['rollback', 'release']);
 });
 
+test('folder description updates leave the existing name intact', async () => {
+  const row = { folderId: 'folder-a', name: 'Original', description: 'Old', role: 'EDITOR', status: 'ACTIVE' };
+  const calls = [];
+  const connection = {
+    async beginTransaction() { calls.push('begin'); },
+    async execute(sql, parameters) {
+      if (sql.startsWith('UPDATE')) {
+        assert.match(sql, /^UPDATE Treatment_Folder SET description = \?, updated_at = CURRENT_TIMESTAMP WHERE folder_id = \?$/);
+        assert.deepEqual(parameters, [null, 'folder-a']);
+        calls.push('write');
+        row.description = null;
+      } else {
+        assert.deepEqual(parameters, ['editor', 'folder-a']);
+        calls.push(sql.endsWith('FOR UPDATE') ? 'lock' : 'read');
+      }
+      return [[row]];
+    },
+    async commit() { calls.push('commit'); },
+    release() { calls.push('release'); },
+  };
+  const repository = createMysqlFolderRepository({ async getConnection() { return connection; } });
+  assert.deepEqual(await repository.updateForUser('editor', 'folder-a', { description: null }, ['OWNER', 'EDITOR']), {
+    folder: { folderId: 'folder-a', name: 'Original', description: null },
+    membership: { role: 'EDITOR', status: 'ACTIVE' },
+  });
+  assert.deepEqual(calls, ['begin', 'lock', 'write', 'read', 'commit', 'release']);
+});
+
 test('create folder rejects an unverified policy and saves a verified folder for the authenticated owner', async (t) => {
   const { createApp } = require('../src/server');
   const { once } = require('node:events');
