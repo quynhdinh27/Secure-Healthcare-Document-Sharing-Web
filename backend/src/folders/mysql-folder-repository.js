@@ -222,6 +222,19 @@ function createMysqlFolderRepository(pool) {
       return row ? toEntry(row) : null;
     },
 
+    async findRotationForUser(userId, rotationId) {
+      const [[job]] = await pool.execute(`
+        SELECT j.rotation_id AS rotationId, j.folder_id AS folderId,
+               j.policy_version AS policyVersion, j.action, j.status,
+               j.created_at AS createdAt, j.finished_at AS finishedAt
+        FROM Folder_Rotation_Job AS j
+        INNER JOIN Folder_Membership AS m ON m.folder_id = j.folder_id
+        WHERE j.rotation_id = ? AND m.user_id = ?
+          AND m.status = 'ACTIVE' AND m.role IN ('OWNER', 'EDITOR')
+      `, [rotationId, userId]);
+      return job ?? null;
+    },
+
     async listMembersForUser(userId, folderId) {
       const [members] = await pool.execute(`
         SELECT member.membership_id AS membershipId, member.user_id AS userId, member.role
