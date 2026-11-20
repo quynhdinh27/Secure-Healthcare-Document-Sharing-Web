@@ -248,6 +248,50 @@ test('folder deletion requires owner reauthentication and exposes cleanup progre
   });
 });
 
+test('rotation list is scoped to active owners and editors and paginates jobs', async (t) => {
+  const jobs = Array.from({ length: 51 }, (_, index) => ({
+    rotationId: String(index), status: index === 0 ? 'PENDING' : 'CANCELLED', canAttemptClaim: index === 0 ? 1 : 0,
+  }));
+  const app = createApp({
+    authenticate(request, _response, next) {
+      const id = request.get('authorization');
+      if (id) request.user = { id };
+      next();
+    },
+    async canReadRotationSources() {
+      assert.fail('Listing should leave source verification to the claim endpoint');
+    },
+    mysqlPool: {
+      async query(sql, [userId, limit, offset]) {
+        assert.match(sql, /m\.folder_id = j\.folder_id/);
+        assert.match(sql, /m\.status = 'ACTIVE' AND m\.role IN \('OWNER', 'EDITOR'\)/);
+        assert.match(sql, /ORDER BY j\.created_at DESC, j\.rotation_id DESC/);
+        assert.equal(limit, 51);
+        return [['owner', 'editor'].includes(userId) ? jobs.slice(offset, offset + limit) : []];
+      },
+    },
+  });
+  const server = app.listen(0, '127.0.0.1');
+  t.after(() => server.close());
+  await once(server, 'listening');
+  const url = `http://127.0.0.1:${server.address().port}/api/v1/key-rotations`;
+  assert.equal((await fetch(url)).status, 401);
+  const editor = { authorization: 'editor' };
+  const first = await fetch(url, { headers: editor });
+  assert.equal(first.headers.get('cache-control'), 'no-store');
+  const firstPage = await first.json();
+  assert.equal(firstPage.rotations.length, 50);
+  assert.equal(firstPage.nextPage, 2);
+  assert.deepEqual(firstPage.rotations[0], { rotationId: '0', status: 'PENDING', canClaim: null });
+  assert.deepEqual(await (await fetch(url + '?page=2', { headers: editor })).json(), {
+    rotations: [{ rotationId: '50', status: 'CANCELLED', canClaim: false }], nextPage: null,
+  });
+  for (const authorization of ['viewer', 'revoked', 'outsider']) {
+    assert.deepEqual(await (await fetch(url, { headers: { authorization } })).json(), { rotations: [], nextPage: null });
+  }
+  assert.equal((await fetch(url + '?page=1&page=2', { headers: editor })).status, 400);
+});
+
 test('rotation status is available only to active owners and editors of the folder', async (t) => {
   const rotationId = 'abc12345-1234-1234-1234-123456789abc';
   const rotation = { rotationId, folderId: 'A', policyVersion: 2, status: 'PENDING' };
