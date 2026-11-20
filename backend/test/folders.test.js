@@ -75,6 +75,61 @@ test('folder endpoints use authenticated identity and expose only active members
   });
 });
 
+test('folder details and signed policy history use current folder membership', async (t) => {
+  const initial = { payload: { purpose: 'INITIAL_FOLDER_POLICY' }, signature: 'initial-signature' };
+  const change = { context: { action: 'ADD_MEMBER' }, ownerSignature: 'member-signature' };
+  const app = createApp({
+    authenticate(request, _response, next) {
+      const id = request.get('authorization');
+      if (id) request.user = { id };
+      next();
+    },
+    mysqlPool: {
+      async execute(sql, args) {
+        if (sql.includes('MAX(p.policy_version)')) {
+          assert.match(sql, /m\.status = 'ACTIVE'/);
+          assert.deepEqual(args, ['viewer', 'A']);
+          return [[{ folderId: 'A', policyVersion: 2, status: 'ACTIVE', role: 'VIEWER' }]];
+        }
+        assert.match(sql, /p\.folder_id = m\.folder_id AND p\.policy_version = \?/);
+        assert.match(sql, /m\.user_id = \? AND m\.status = 'ACTIVE'/);
+        const [version, folderId, userId] = args;
+        assert.equal(folderId, 'A');
+        if (userId !== 'viewer') return [[]];
+        if (version === 1) {
+          return [[{ policyVersion: 1, signedPolicy: { ...initial, extra: 'unverified input field' } }]];
+        }
+        if (version === 2) return [[{ policyVersion: 2, signedPolicy: JSON.stringify(change) }]];
+        return [[{ policyVersion: null }]];
+      },
+    },
+  });
+  const server = app.listen(0, '127.0.0.1');
+  t.after(() => server.close());
+  await once(server, 'listening');
+  const folderUrl = `http://127.0.0.1:${server.address().port}/api/v1/folders/A`;
+  const headers = { authorization: 'viewer' };
+  const details = await fetch(folderUrl, { headers });
+  assert.deepEqual(await details.json(), { folderId: 'A', policyVersion: 2, role: 'VIEWER' });
+
+  const policiesUrl = folderUrl + '/policies/';
+  for (const [version, signedPolicy] of [[1, initial], [2, change]]) {
+    const response = await fetch(policiesUrl + version, { headers });
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get('cache-control'), 'no-store');
+    assert.deepEqual(await response.json(), { folderId: 'A', policyVersion: version, signedPolicy });
+  }
+
+  assert.equal((await fetch(policiesUrl + '1')).status, 401);
+  for (const authorization of ['revoked', 'outsider']) {
+    assert.equal((await fetch(policiesUrl + '1', { headers: { authorization } })).status, 403);
+  }
+  assert.equal((await fetch(policiesUrl + '3', { headers })).status, 404);
+  for (const version of ['0', '1e0', '4294967296']) {
+    assert.equal((await fetch(policiesUrl + version, { headers })).status, 400);
+  }
+});
+
 test('rotation status is available only to active owners and editors of the folder', async (t) => {
   const rotationId = 'abc12345-1234-1234-1234-123456789abc';
   const rotation = { rotationId, folderId: 'A', policyVersion: 2, status: 'PENDING' };
