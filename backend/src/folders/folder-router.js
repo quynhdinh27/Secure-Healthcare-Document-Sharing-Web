@@ -16,7 +16,9 @@ function hasFolderPermission(membership, action) {
     && rolesByAction[action].has(membership.role);
 }
 
-function createFolderRouter({ authenticate, folderRepository, verifyInitialFolderPolicy } = {}) {
+function createFolderRouter({
+  authenticate, folderRepository, verifyInitialFolderPolicy, verifyFolderPolicy, queueFolderRotation,
+} = {}) {
   const router = express.Router();
 
   if (authenticate) router.use(authenticate);
@@ -123,6 +125,35 @@ function createFolderRouter({ authenticate, folderRepository, verifyInitialFolde
     }
     response.json({ ...updated.folder, role: updated.membership.role });
   });
+
+  function applyMemberChange(action) {
+    return async (request, response) => {
+      const isRevoke = action === 'REVOKE_MEMBER';
+      const policyContextId = isRevoke ? request.get('X-Policy-Context-Id') : request.body?.policyContextId;
+      const ownerSignature = isRevoke ? request.get('X-Policy-Signature') : request.body?.ownerSignature;
+      if (typeof policyContextId !== 'string' || !/^[a-f0-9-]{36}$/.test(policyContextId)
+          || typeof ownerSignature !== 'string' || !ownerSignature.trim()) {
+        return response.status(400).json({ code: 'INVALID_POLICY_MUTATION_INPUT' });
+      }
+      if (typeof folderRepository.applyMemberChange !== 'function'
+          || typeof verifyFolderPolicy !== 'function' || typeof queueFolderRotation !== 'function') {
+        return response.status(503).json({ code: 'FOLDER_SERVICE_UNAVAILABLE' });
+      }
+      const result = await folderRepository.applyMemberChange({
+        ownerId: request.user.id, folderId: request.params.folderId,
+        membershipId: request.params.membershipId, action, policyContextId, ownerSignature,
+        verifyFolderPolicy, queueFolderRotation,
+      });
+      if (result.code === 'FORBIDDEN') return response.status(403).json(result);
+      if (result.code === 'INVALID_SIGNATURE') return response.status(422).json(result);
+      if (result.code) return response.status(409).json(result);
+      response.status(202).json(result);
+    };
+  }
+
+  router.post('/:folderId/members', express.json(), applyMemberChange('ADD_MEMBER'));
+  router.patch('/:folderId/members/:membershipId', express.json(), applyMemberChange('CHANGE_ROLE'));
+  router.delete('/:folderId/members/:membershipId', applyMemberChange('REVOKE_MEMBER'));
 
   return router;
 }
