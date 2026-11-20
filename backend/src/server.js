@@ -91,6 +91,21 @@ function createApp({
     if (result.code) return response.status(409).json(result);
     response.json(result);
   });
+  rotations.post('/:rotationId/lease/renew', express.json(), async function renewRotationLease(request, response) {
+    const { generation } = request.body ?? {};
+    if (!Number.isInteger(generation) || generation < 1 || generation > 4294967295) {
+      return response.status(400).json({ code: 'INVALID_ROTATION_GENERATION' });
+    }
+    if (typeof canReadRotationSources !== 'function' || typeof repository?.renewRotationLeaseForUser !== 'function') {
+      return response.status(503).json({ code: 'ROTATION_SERVICE_UNAVAILABLE' });
+    }
+    const result = await repository.renewRotationLeaseForUser(
+      request.user.id, request.params.rotationId, generation, canReadRotationSources,
+    );
+    if (result.code === 'ROTATION_NOT_FOUND') return response.status(404).json(result);
+    if (result.code) return response.status(409).json(result);
+    response.json(result);
+  });
   app.use('/api/v1/key-rotations', rotations);
 
   app.use((error, _request, response, next) => {

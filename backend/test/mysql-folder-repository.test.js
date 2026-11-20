@@ -3,8 +3,9 @@ const { test } = require('node:test');
 const { createMysqlFolderRepository } = require('../src/folders/mysql-folder-repository');
 const { queueMysqlFolderRotation } = require('../src/folders/mysql-folder-rotation-queue');
 
-test('rotation claim locks the folder, checks source access and grants only one active lease', async () => {
+test('rotation claim and renewal enforce current membership, source access and lease ownership', async () => {
   const leaseExpiresAt = '2026-11-20T08:15:00.000000Z';
+  const renewedUntil = '2026-11-20T08:17:00.000000Z';
   const job = { folderId: 'A', policyVersion: 2, status: 'PENDING', generation: 0 };
   const events = [];
   const connection = {
@@ -24,6 +25,14 @@ test('rotation claim locks the folder, checks source access and grants only one 
       }
       if (sql.includes('UPDATE Folder_Rotation_Job')) {
         assert.match(sql, /INTERVAL 5 MINUTE/);
+        if (!sql.includes('generation = generation + 1')) {
+          assert.match(sql, /lease_expires_at > UTC_TIMESTAMP\(3\)/);
+          assert.deepEqual(args, ['rotation']);
+          if (!job.leaseActive) return [{ affectedRows: 0 }];
+          events.push('lease renew');
+          job.leaseExpiresAt = renewedUntil;
+          return [{ affectedRows: 1 }];
+        }
         events.push('lease write');
         Object.assign(job, {
           executorId: args[0], status: 'IN_PROGRESS', generation: job.generation + 1,
@@ -32,7 +41,7 @@ test('rotation claim locks the folder, checks source access and grants only one 
         return [{ affectedRows: 1 }];
       }
       assert.match(sql, /SELECT generation/);
-      return [[{ generation: job.generation, leaseExpiresAt }]];
+      return [[{ generation: job.generation, leaseExpiresAt: job.leaseExpiresAt }]];
     },
     async commit() { events.push('commit'); },
     async rollback() { events.push('rollback'); },
@@ -54,9 +63,22 @@ test('rotation claim locks the folder, checks source access and grants only one 
   assert.deepEqual(events, ['begin', 'folder lock', 'source check', 'lease write', 'commit', 'release']);
   assert.deepEqual(await claim('editor'), first);
   assert.deepEqual(await claim('owner'), { code: 'ROTATION_ALREADY_CLAIMED' });
-  job.leaseActive = 0;
+  const renew = (userId, generation, verify = async () => true) => (
+    repository.renewRotationLeaseForUser(userId, 'rotation', generation, verify)
+  );
+  assert.deepEqual(await renew('viewer', 1), { code: 'ROTATION_NOT_FOUND' });
+  assert.deepEqual(await renew('owner', 1), { code: 'LEASE_EXPIRED' });
+  assert.deepEqual(await renew('editor', 2), { code: 'LEASE_EXPIRED' });
+  assert.deepEqual(await renew('editor', 1, async () => false), { code: 'ROTATION_SOURCE_UNAVAILABLE' });
+  assert.deepEqual(await renew('editor', 1), { ...first, leaseExpiresAt: renewedUntil });
+  assert.deepEqual(await renew('editor', 1, async () => {
+    job.leaseActive = 0;
+    return true;
+  }), { code: 'LEASE_EXPIRED' });
+  assert.deepEqual(await renew('editor', 1), { code: 'LEASE_EXPIRED' });
   assert.deepEqual(await claim('owner'), { ...first, generation: 2 });
   job.status = 'CANCELLED';
+  assert.deepEqual(await renew('owner', 2), { code: 'LEASE_EXPIRED' });
   assert.deepEqual(await claim('owner'), { code: 'ROTATION_NOT_CLAIMABLE' });
 });
 

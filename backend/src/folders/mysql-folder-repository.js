@@ -79,11 +79,11 @@ async function commitMemberChange(connection, input) {
   return { policyVersion, rotationId };
 }
 
-async function claimRotation(connection, userId, rotationId, canReadRotationSources) {
+async function lockRotationForUser(connection, userId, rotationId) {
   const [[location]] = await connection.execute(
     'SELECT folder_id AS folderId FROM Folder_Rotation_Job WHERE rotation_id = ?', [rotationId],
   );
-  if (!location) return { code: 'ROTATION_NOT_FOUND' };
+  if (!location) return null;
 
   // Use the same lock order as membership changes and job cancellation.
   await connection.execute('SELECT folder_id FROM Treatment_Folder WHERE folder_id = ? FOR UPDATE', [location.folderId]);
@@ -98,6 +98,19 @@ async function claimRotation(connection, userId, rotationId, canReadRotationSour
       AND m.status = 'ACTIVE' AND m.role IN ('OWNER', 'EDITOR')
     FOR UPDATE
   `, [rotationId, userId]);
+  return job ?? null;
+}
+
+async function readRotationLease(connection, rotationId) {
+  const [[lease]] = await connection.execute(`
+    SELECT generation, DATE_FORMAT(lease_expires_at, '%Y-%m-%dT%H:%i:%s.%fZ') AS leaseExpiresAt
+    FROM Folder_Rotation_Job WHERE rotation_id = ? FOR UPDATE
+  `, [rotationId]);
+  return { rotationId, ...lease, status: 'IN_PROGRESS' };
+}
+
+async function claimRotation(connection, userId, rotationId, canReadRotationSources) {
+  const job = await lockRotationForUser(connection, userId, rotationId);
   if (!job) return { code: 'ROTATION_NOT_FOUND' };
   if (!['PENDING', 'WAITING_FOR_CLIENT', 'IN_PROGRESS'].includes(job.status)) {
     return { code: 'ROTATION_NOT_CLAIMABLE' };
@@ -121,15 +134,48 @@ async function claimRotation(connection, userId, rotationId, canReadRotationSour
         lease_expires_at = UTC_TIMESTAMP(3) + INTERVAL 5 MINUTE
     WHERE rotation_id = ?
   `, [userId, rotationId]);
-  const [[lease]] = await connection.execute(`
-    SELECT generation, DATE_FORMAT(lease_expires_at, '%Y-%m-%dT%H:%i:%s.%fZ') AS leaseExpiresAt
-    FROM Folder_Rotation_Job WHERE rotation_id = ? FOR UPDATE
+  return readRotationLease(connection, rotationId);
+}
+
+async function renewRotationLease(connection, userId, rotationId, generation, canReadRotationSources) {
+  const job = await lockRotationForUser(connection, userId, rotationId);
+  if (!job) return { code: 'ROTATION_NOT_FOUND' };
+  if (job.status !== 'IN_PROGRESS' || job.executorId !== String(userId)
+      || job.generation !== generation || Number(job.leaseActive) !== 1) {
+    return { code: 'LEASE_EXPIRED' };
+  }
+
+  if (await canReadRotationSources({ connection, userId, rotationId, folderId: job.folderId, policyVersion: job.policyVersion }) !== true) {
+    return { code: 'ROTATION_SOURCE_UNAVAILABLE' };
+  }
+
+  const [result] = await connection.execute(`
+    UPDATE Folder_Rotation_Job
+    SET lease_expires_at = UTC_TIMESTAMP(3) + INTERVAL 5 MINUTE
+    WHERE rotation_id = ? AND lease_expires_at > UTC_TIMESTAMP(3)
   `, [rotationId]);
-  return { rotationId, ...lease, status: 'IN_PROGRESS' };
+  if (result.affectedRows !== 1) return { code: 'LEASE_EXPIRED' };
+  return readRotationLease(connection, rotationId);
 }
 
 function createMysqlFolderRepository(pool) {
   const findFolderQuery = memberFoldersQuery + ' AND f.folder_id = ?';
+
+  async function changeRotationLease(operation) {
+    const connection = await pool.getConnection();
+    try {
+      await connection.beginTransaction();
+      const result = await operation(connection);
+      if (result.code) await connection.rollback();
+      else await connection.commit();
+      return result;
+    } catch (error) {
+      await connection.rollback();
+      throw error;
+    } finally {
+      connection.release();
+    }
+  }
 
   return {
     async applyMemberChange(input) {
@@ -284,20 +330,14 @@ function createMysqlFolderRepository(pool) {
       return job ?? null;
     },
 
-    async claimRotationForUser(userId, rotationId, canReadRotationSources) {
-      const connection = await pool.getConnection();
-      try {
-        await connection.beginTransaction();
-        const result = await claimRotation(connection, userId, rotationId, canReadRotationSources);
-        if (result.code) await connection.rollback();
-        else await connection.commit();
-        return result;
-      } catch (error) {
-        await connection.rollback();
-        throw error;
-      } finally {
-        connection.release();
-      }
+    claimRotationForUser(userId, rotationId, canReadRotationSources) {
+      return changeRotationLease((connection) => claimRotation(connection, userId, rotationId, canReadRotationSources));
+    },
+
+    renewRotationLeaseForUser(userId, rotationId, generation, canReadRotationSources) {
+      return changeRotationLease(
+        (connection) => renewRotationLease(connection, userId, rotationId, generation, canReadRotationSources),
+      );
     },
 
     async listMembersForUser(userId, folderId) {
