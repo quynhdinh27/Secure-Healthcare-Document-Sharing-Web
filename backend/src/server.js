@@ -7,6 +7,7 @@ const { queueMysqlFolderRotation } = require('./folders/mysql-folder-rotation-qu
 function createApp({
   authenticate, mysqlPool, folderRepository, folderPolicyKeys,
   verifyInitialFolderPolicy, verifyFolderPolicy, queueFolderRotation, canReadRotationSources,
+  verifyFolderDeletionReauth,
 } = {}) {
   const app = express();
 
@@ -52,6 +53,7 @@ function createApp({
     verifyInitialFolderPolicy: verifyInitialFolderPolicy ?? policyVerifiers.verifyInitialFolderPolicy,
     verifyFolderPolicy: verifyFolderPolicy ?? policyVerifiers.verifyFolderPolicy,
     queueFolderRotation: queueFolderRotation ?? (mysqlPool && !folderRepository ? queueMysqlFolderRotation : undefined),
+    verifyFolderDeletionReauth,
   }));
   const dashboard = express.Router();
   if (authenticate) dashboard.use(authenticate);
@@ -107,6 +109,20 @@ function createApp({
     response.json(result);
   });
   app.use('/api/v1/key-rotations', rotations);
+
+  const operations = express.Router();
+  if (authenticate) operations.use(authenticate);
+  operations.get('/:operationId', async function getOperation(request, response) {
+    response.set('Cache-Control', 'no-store');
+    if (!request.user?.id) return response.status(401).json({ code: 'UNAUTHENTICATED' });
+    if (typeof repository?.findDeletionOperationForUser !== 'function') {
+      return response.status(503).json({ code: 'FOLDER_SERVICE_UNAVAILABLE' });
+    }
+    const operation = await repository.findDeletionOperationForUser(request.user.id, request.params.operationId);
+    if (!operation) return response.status(404).json({ code: 'OPERATION_NOT_FOUND' });
+    response.json(operation);
+  });
+  app.use('/api/v1/operations', operations);
 
   app.use((error, _request, response, next) => {
     if (response.headersSent) return next(error);

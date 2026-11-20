@@ -1,4 +1,5 @@
 const { randomBytes, randomUUID } = require('node:crypto');
+const { cancelMysqlFolderRotations } = require('./mysql-folder-rotation-queue');
 
 const memberFoldersQuery = `
   SELECT f.folder_id AS folderId, f.folder_name AS name, f.episode_ref AS treatmentReference,
@@ -176,10 +177,43 @@ async function renewRotationLease(connection, userId, rotationId, generation, ca
   return readRotationLease(connection, rotationId);
 }
 
+async function beginFolderDeletion(connection, ownerId, folderId) {
+  const [[folder]] = await connection.execute(
+    'SELECT folder_id FROM Treatment_Folder WHERE folder_id = ? FOR UPDATE', [folderId],
+  );
+  if (!folder) return { code: 'FORBIDDEN' };
+
+  const [[previous]] = await connection.execute(`
+    SELECT operation_id AS operationId, status
+    FROM Folder_Deletion_Operation WHERE folder_id = ? AND requested_by = ? FOR UPDATE
+  `, [folderId, ownerId]);
+  if (previous) return previous;
+
+  const [[owner]] = await connection.execute(`
+    SELECT membership_id FROM Folder_Membership
+    WHERE folder_id = ? AND user_id = ? AND role = 'OWNER' AND status = 'ACTIVE'
+    FOR UPDATE
+  `, [folderId, ownerId]);
+  if (!owner) return { code: 'FORBIDDEN' };
+
+  const operationId = randomUUID();
+  await connection.execute(`
+    INSERT INTO Folder_Deletion_Operation (operation_id, folder_id, requested_by)
+    VALUES (?, ?, ?)
+  `, [operationId, folderId, ownerId]);
+  await connection.execute(`
+    UPDATE Folder_Membership
+    SET status = 'REVOKED', revoked_by = ?, revoked_at = CURRENT_TIMESTAMP
+    WHERE folder_id = ? AND status = 'ACTIVE'
+  `, [ownerId, folderId]);
+  await cancelMysqlFolderRotations(connection, folderId);
+  return { operationId, status: 'PENDING' };
+}
+
 function createMysqlFolderRepository(pool) {
   const findFolderQuery = memberFoldersQuery + ' AND f.folder_id = ?';
 
-  async function changeRotationLease(operation) {
+  async function runFolderTransaction(operation) {
     const connection = await pool.getConnection();
     try {
       await connection.beginTransaction();
@@ -235,6 +269,18 @@ function createMysqlFolderRepository(pool) {
   }
 
   return {
+    deleteForOwner(ownerId, folderId) {
+      return runFolderTransaction((connection) => beginFolderDeletion(connection, ownerId, folderId));
+    },
+
+    async findDeletionOperationForUser(userId, operationId) {
+      const [[operation]] = await pool.execute(`
+        SELECT operation_id AS operationId, folder_id AS folderId, status, created_at AS createdAt
+        FROM Folder_Deletion_Operation WHERE operation_id = ? AND requested_by = ?
+      `, [operationId, userId]);
+      return operation ?? null;
+    },
+
     async applyMemberChange(input) {
       const connection = await pool.getConnection();
       try {
@@ -418,11 +464,11 @@ function createMysqlFolderRepository(pool) {
     },
 
     claimRotationForUser(userId, rotationId, canReadRotationSources) {
-      return changeRotationLease((connection) => claimRotation(connection, userId, rotationId, canReadRotationSources));
+      return runFolderTransaction((connection) => claimRotation(connection, userId, rotationId, canReadRotationSources));
     },
 
     renewRotationLeaseForUser(userId, rotationId, generation, canReadRotationSources) {
-      return changeRotationLease(
+      return runFolderTransaction(
         (connection) => renewRotationLease(connection, userId, rotationId, generation, canReadRotationSources),
       );
     },

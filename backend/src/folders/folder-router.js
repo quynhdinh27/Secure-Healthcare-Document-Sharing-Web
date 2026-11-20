@@ -18,6 +18,7 @@ function hasFolderPermission(membership, action) {
 
 function createFolderRouter({
   authenticate, folderRepository, verifyInitialFolderPolicy, verifyFolderPolicy, queueFolderRotation,
+  verifyFolderDeletionReauth,
 } = {}) {
   const router = express.Router();
 
@@ -153,6 +154,20 @@ function createFolderRouter({
       return response.status(403).json({ code: 'FORBIDDEN' });
     }
     response.json({ ...updated.folder, role: updated.membership.role });
+  });
+
+  router.delete('/:folderId', async function deleteFolder(request, response) {
+    response.set('Cache-Control', 'no-store');
+    if (typeof verifyFolderDeletionReauth !== 'function' || typeof folderRepository.deleteForOwner !== 'function') {
+      return response.status(503).json({ code: 'FOLDER_SERVICE_UNAVAILABLE' });
+    }
+    if (await verifyFolderDeletionReauth(request) !== true) {
+      return response.status(403).json({ code: 'REAUTHENTICATION_REQUIRED' });
+    }
+    const result = await folderRepository.deleteForOwner(request.user.id, request.params.folderId);
+    if (result.code === 'FORBIDDEN') return response.status(403).json(result);
+    const pending = result.status === 'PENDING' || result.status === 'IN_PROGRESS';
+    response.status(pending ? 202 : 200).location('/api/v1/operations/' + result.operationId).json(result);
   });
 
   function applyMemberChange(action) {
