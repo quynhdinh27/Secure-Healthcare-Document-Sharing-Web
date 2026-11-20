@@ -6,7 +6,7 @@ const { queueMysqlFolderRotation } = require('./folders/mysql-folder-rotation-qu
 
 function createApp({
   authenticate, mysqlPool, folderRepository, folderPolicyKeys,
-  verifyInitialFolderPolicy, verifyFolderPolicy, queueFolderRotation,
+  verifyInitialFolderPolicy, verifyFolderPolicy, queueFolderRotation, canReadRotationSources,
 } = {}) {
   const app = express();
 
@@ -65,19 +65,31 @@ function createApp({
   app.use('/api/v1/dashboard', dashboard);
   const rotations = express.Router();
   if (authenticate) rotations.use(authenticate);
-  rotations.get('/:rotationId', async function getRotation(request, response) {
+  rotations.use('/:rotationId', (request, response, next) => {
     response.set('Cache-Control', 'no-store');
     if (!request.user?.id) return response.status(401).json({ code: 'UNAUTHENTICATED' });
     const { rotationId } = request.params;
     if (!/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(rotationId)) {
       return response.status(400).json({ code: 'INVALID_ROTATION_ID' });
     }
+    next();
+  });
+  rotations.get('/:rotationId', async function getRotation(request, response) {
     if (typeof repository?.findRotationForUser !== 'function') {
       return response.status(503).json({ code: 'FOLDER_SERVICE_UNAVAILABLE' });
     }
-    const rotation = await repository.findRotationForUser(request.user.id, rotationId);
+    const rotation = await repository.findRotationForUser(request.user.id, request.params.rotationId);
     if (!rotation) return response.status(404).json({ code: 'ROTATION_NOT_FOUND' });
     response.json(rotation);
+  });
+  rotations.post('/:rotationId/claim', async function claimRotation(request, response) {
+    if (typeof canReadRotationSources !== 'function' || typeof repository?.claimRotationForUser !== 'function') {
+      return response.status(503).json({ code: 'ROTATION_SERVICE_UNAVAILABLE' });
+    }
+    const result = await repository.claimRotationForUser(request.user.id, request.params.rotationId, canReadRotationSources);
+    if (result.code === 'ROTATION_NOT_FOUND') return response.status(404).json(result);
+    if (result.code) return response.status(409).json(result);
+    response.json(result);
   });
   app.use('/api/v1/key-rotations', rotations);
 
