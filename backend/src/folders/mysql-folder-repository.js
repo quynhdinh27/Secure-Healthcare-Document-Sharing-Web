@@ -352,8 +352,30 @@ function createMysqlFolderRepository(pool) {
     },
 
     async findForUser(userId, folderId) {
-      const [[row]] = await pool.execute(findFolderQuery, [userId, folderId]);
+      const [[row]] = await pool.execute(`
+        SELECT folder.*,
+               (SELECT MAX(p.policy_version) FROM Folder_Policy AS p
+                WHERE p.folder_id = folder.folderId) AS policyVersion
+        FROM (${findFolderQuery}) AS folder
+      `, [userId, folderId]);
       return row ? toEntry(row) : null;
+    },
+
+    async findPolicyForUser(userId, folderId, policyVersion) {
+      const [[row]] = await pool.execute(`
+        SELECT p.policy_version AS policyVersion, p.signed_policy AS signedPolicy
+        FROM Folder_Membership AS m
+        LEFT JOIN Folder_Policy AS p ON p.folder_id = m.folder_id AND p.policy_version = ?
+        WHERE m.folder_id = ? AND m.user_id = ? AND m.status = 'ACTIVE'
+      `, [policyVersion, folderId, userId]);
+      if (!row) return { code: 'FORBIDDEN' };
+      if (row.policyVersion === null) return { code: 'POLICY_NOT_FOUND' };
+
+      const stored = typeof row.signedPolicy === 'string' ? JSON.parse(row.signedPolicy) : row.signedPolicy;
+      const signedPolicy = row.policyVersion === 1
+        ? { payload: stored.payload, signature: stored.signature }
+        : { context: stored.context, ownerSignature: stored.ownerSignature };
+      return { folderId, policyVersion: row.policyVersion, signedPolicy };
     },
 
     async findRotationForUser(userId, rotationId) {

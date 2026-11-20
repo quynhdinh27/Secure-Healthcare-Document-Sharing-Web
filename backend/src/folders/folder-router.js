@@ -77,6 +77,22 @@ function createFolderRouter({
     response.json({ members });
   });
 
+  router.get('/:folderId/policies/:policyVersion', async function getFolderPolicy(request, response) {
+    response.set('Cache-Control', 'no-store');
+    const { folderId, policyVersion } = request.params;
+    const version = Number(policyVersion);
+    if (!/^[1-9][0-9]{0,9}$/.test(policyVersion) || version > 4294967295) {
+      return response.status(400).json({ code: 'INVALID_POLICY_VERSION' });
+    }
+    if (typeof folderRepository.findPolicyForUser !== 'function') {
+      return response.status(503).json({ code: 'FOLDER_SERVICE_UNAVAILABLE' });
+    }
+    const policy = await folderRepository.findPolicyForUser(request.user.id, folderId, version);
+    if (policy.code === 'FORBIDDEN') return response.status(403).json(policy);
+    if (policy.code === 'POLICY_NOT_FOUND') return response.status(404).json(policy);
+    response.json(policy);
+  });
+
   router.post('/:folderId/policy-contexts', express.json(), async function createPolicyContext(request, response) {
     const { action, userId, membershipId, role } = request.body ?? {};
     const idPattern = /^[1-9][0-9]{0,19}$/;
