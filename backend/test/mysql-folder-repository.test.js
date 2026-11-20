@@ -142,3 +142,62 @@ test('policy context snapshots a revocation without changing membership', async 
   assert.equal(members.length, 2);
   assert.equal(statements.filter((sql) => sql.startsWith('INSERT')).length, 1);
 });
+
+test('member revocation commits policy and rotation together and rolls back if rotation fails', async () => {
+  const events = [];
+  const context = {
+    action: 'REVOKE_MEMBER', target: { membershipId: '2' },
+    expectedPolicyVersion: 1, proposedPolicy: { policyVersion: 2 },
+  };
+  let expired = false;
+  const connection = {
+    async beginTransaction() { events.push('begin'); },
+    async execute(sql, args) {
+      if (sql.includes('FROM Treatment_Folder')) return [[{ folder_id: 'A' }]];
+      if (sql.includes('FROM Folder_Membership')) return [[{ membershipId: '1' }]];
+      if (sql.includes('FROM Folder_Policy_Context')) return [[{ payload: context, expired }]];
+      if (sql.includes('MAX(policy_version)')) return [[{ version: 1 }]];
+      if (sql.startsWith('UPDATE Folder_Membership')) {
+        assert.deepEqual(args, ['7', 'A', '2']);
+        events.push('revoke');
+      } else if (sql.includes('INSERT INTO Folder_Policy')) events.push('save policy');
+      else if (sql.includes('UPDATE Folder_Policy_Context')) events.push('consume context');
+      else assert.fail('Unexpected SQL: ' + sql);
+      return [{ affectedRows: 1 }];
+    },
+    async commit() { events.push('commit'); },
+    async rollback() { events.push('rollback'); },
+    release() { events.push('release'); },
+  };
+  const repository = createMysqlFolderRepository({ async getConnection() { return connection; } });
+  let failRotation = false;
+  const input = {
+    ownerId: '7', folderId: 'A', membershipId: '2', action: 'REVOKE_MEMBER',
+    policyContextId: 'context', ownerSignature: 'fixture',
+    async verifyFolderPolicy({ context: storedContext }) {
+      assert.equal(storedContext, context);
+      events.push('verify');
+      return true;
+    },
+    async queueFolderRotation({ connection: transaction, policyVersion }) {
+      assert.equal(transaction, connection);
+      assert.equal(policyVersion, 2);
+      events.push('rotation');
+      if (failRotation) throw new Error('queue failed');
+      return 'rotation-1';
+    },
+  };
+
+  assert.deepEqual(await repository.applyMemberChange(input), { policyVersion: 2, rotationId: 'rotation-1' });
+  assert.deepEqual(events, ['begin', 'verify', 'revoke', 'save policy', 'consume context', 'rotation', 'commit', 'release']);
+
+  events.length = 0;
+  failRotation = true;
+  await assert.rejects(repository.applyMemberChange(input), /queue failed/);
+  assert.deepEqual(events, ['begin', 'verify', 'revoke', 'save policy', 'consume context', 'rotation', 'rollback', 'release']);
+
+  events.length = 0;
+  expired = true;
+  assert.deepEqual(await repository.applyMemberChange(input), { code: 'POLICY_CONTEXT_INVALID' });
+  assert.deepEqual(events, ['begin', 'rollback', 'release']);
+});
