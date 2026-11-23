@@ -116,7 +116,7 @@ Không sửa: `src/folders/*`, migration `001`–`008`, test của folders, `scr
 
 | # | Điểm cần chốt | Hỏi ai |
 |---|---|---|
-| 5.1 | Định dạng CryptoManifest (spec mục 7.4), quy ước AAD, encoding base64url, tên field multipart (`metadata`, `ciphertext`) | Crypto, FE |
+| 5.1 | Định dạng CryptoManifest (spec mục 7.4), quy ước AAD và nhãn RSA-OAEP, encoding base64url, tên field multipart (`metadata`, `ciphertext`) | Crypto, FE |
 | 5.2 | Bảng `User` và `User_Key` tối thiểu có dùng làm nền chung không. Quy ước `request.user.id` là chuỗi số | Auth, Key Mgmt |
 | 5.3 | Editor không được xóa tài liệu (mục 2.1) | Cả nhóm |
 | 5.4 | Giới hạn upload 25 MB (`MAX_UPLOAD_MB`) | Cả nhóm |

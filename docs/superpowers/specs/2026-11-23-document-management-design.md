@@ -59,7 +59,8 @@ backend/
 │   ├─ migrate.cjs
 │   ├─ seed.cjs
 │   ├─ dev-complete-rotations.cjs
-│   └─ smoke-documents.cjs
+│   ├─ smoke-documents.cjs
+│   └─ lib/                      tạo user và key dev, ký payload, mã hóa/giải mã như client (dùng chung cho seed và smoke)
 └─ src/
     ├─ main.js
     ├─ config.js
@@ -79,7 +80,7 @@ backend/
 | `config.js` | Đọc và kiểm tra env, trả object config đóng băng. Ném lỗi nếu thiếu biến, hoặc nếu `AUTH_MODE=dev` khi `NODE_ENV=production`. | `process.env` |
 | `auth/dev-header-auth.js` | Đọc `X-Dev-User-Id` (chuỗi số từ 1 đến 20 chữ số), gán `request.user = { id }`. Không kiểm tra thêm gì, vì router tự trả 401 khi thiếu user. | không |
 | `storage/local-object-storage.js` | `put(key, buffer)`, `get(key) → Buffer`, `delete(key)`. Key phải khớp `^[0-9a-f-]{36}/[0-9a-f-]{36}$`. Ghi file tạm rồi `rename` để tránh file ghi dở. `delete` thành công cả khi file không tồn tại. | `node:fs` |
-| `keys/mysql-key-directory.js` | `lookupActiveSigningKey(conn, userId) → JWK \| null`, `canReceiveFolderKeys(conn, userId) → bool`, `getActiveSigningKey(conn, userId) → { keyId, publicKeyJwk } \| null`, `getSigningKeyById(conn, keyId)`. Hai hàm đầu có cùng chữ ký mà `createFolderPolicyVerifiers` đang dùng. | MySQL |
+| `keys/mysql-key-directory.js` | `lookupActiveSigningKey(conn, userId) → JWK \| null`, `canReceiveFolderKeys(conn, userId) → bool`, `getActiveSigningKey(conn, userId)` và `getActiveEncryptionKey(conn, userId)` → `{ keyId, userId, publicKeyJwk, fingerprint } \| null`, `getSigningKeyById(conn, keyId)`. Thêm hai hàm thuần `toPublicJwk(jwk, purpose)` (chỉ giữ các trường bắt buộc của public JWK) và `fingerprintPublicJwk(jwk)`. Hai hàm đầu có cùng chữ ký mà `createFolderPolicyVerifiers` đang dùng. | MySQL |
 | `documents/document-manifest.js` | Hàm thuần, không đụng DB: `buildExpectedManifest(context, upload)`, `verifyManifestSignature(jwk, manifest, signature)` (JCS + ECDSA P-256 + IEEE-P1363 base64url), `checkEnvelopes(context.recipients, envelopes, manifest.recipients)`. | `canonicalize`, `node:crypto` |
 | `documents/document-router.js` | Validate input, parse multipart bằng `multer` (lưu trong bộ nhớ, có giới hạn kích thước), tính SHA-256 ciphertext, gọi repository, map `{ code }` sang HTTP. Không chạm DB. | repository, storage |
 | `documents/mysql-document-repository.js` | Mọi truy vấn và transaction. Kiểm tra lại membership, role và trạng thái folder ngay trong transaction ghi, khóa theo thứ tự `Treatment_Folder` trước rồi mới tới các dòng khác. | MySQL pool, keyDirectory, manifest |
@@ -223,7 +224,8 @@ Tag GCM 16 byte nằm cuối ciphertext, đúng với cách WebCrypto xuất ra.
 - **Không để lộ sự tồn tại:**
   - Document hoặc version không tồn tại, hoặc người gọi không có membership ACTIVE ở folder chứa nó: trả `404 DOCUMENT_NOT_FOUND` / `VERSION_NOT_FOUND`.
   - Có membership nhưng role không đủ: trả `403 FORBIDDEN`.
-  - Với các endpoint có `:folderId`, người không phải thành viên nhận `403 FORBIDDEN`, giống folders.
+  - Với các endpoint có `:folderId`, người không phải thành viên nhận `403 FORBIDDEN`, giống folders. `folderId` sai định dạng UUID cũng trả `403 FORBIDDEN`.
+  - `documentId` hoặc `versionId` sai định dạng UUID: trả `400 INVALID_DOCUMENT_ID` / `INVALID_VERSION_ID`.
 - **Cache:** mọi response có `Cache-Control: no-store`.
 - **Định dạng ID và thời gian:**
   - UUID dạng chữ thường, kiểm tra bằng regex giống folders.
@@ -312,10 +314,11 @@ Tag GCM 16 byte nằm cuối ciphertext, đúng với cách WebCrypto xuất ra.
 - **Cách ký:** `signature = base64url(ECDSA_P256_SHA256(JCS(manifest)))`, chữ ký dạng IEEE-P1363 dài 64 byte. Giống cách verify folder policy trong `folder-policy-signatures.js`.
 - **Thứ tự:** `recipients` sắp theo `userId` (so sánh dạng số), cùng thứ tự với `context.recipients`.
 - **AAD:** client dùng `JCS({ folderId, documentId, versionId, revisionId, purpose })` làm AAD cho AES-GCM. Backend không giải mã nên không kiểm tra AAD. Quy ước này ghi ra để FE và Crypto thống nhất.
+- **Nhãn RSA-OAEP (System design 11.3):** client dùng `label = JCS({ purpose: "DEK_ENVELOPE", folderId, documentId, versionId, revisionId, recipientKeyId })` khi bọc và mở DEK. Backend không kiểm tra nhãn.
 - **AuthorRecord** nằm trong container đã mã hóa, backend không đọc được. Backend chỉ lưu `authorRecordSha256` đã được ký.
 
 ### 7.5 `GET /api/v1/documents/:documentId` → `getDocument` (O/E/V)
-Response `200` gồm: `{ documentId, folderId, documentName, category, originalUploaderId, currentVersionId, currentVersionNumber, role, createdAt, updatedAt }`.
+Response `200` gồm các trường như 7.1 cộng thêm `role`: `{ documentId, folderId, documentName, category, originalUploaderId, currentVersionId, currentVersionNumber, ciphertextSize, createdAt, updatedAt, role }`.
 
 ### 7.6 `PATCH /api/v1/documents/:documentId` → `updateDocumentMetadata` (O/E)
 - **Body:** chỉ có `documentName` và/hoặc `category`, phải có ít nhất một trường. Có trường khác thì trả `400 INVALID_DOCUMENT_INPUT`.
