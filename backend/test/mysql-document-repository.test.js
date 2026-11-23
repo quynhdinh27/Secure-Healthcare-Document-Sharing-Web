@@ -230,3 +230,60 @@ test('publishing a new version re-checks the context under lock and rejects stal
     assert.deepEqual(events.slice(-2), ['rollback', 'release']);
   }
 });
+
+function documentAccessHandler(roles, extra) {
+  return (sql, args, events) => {
+    if (sql === 'SELECT folder_id AS folderId FROM Document WHERE document_id = ?') return [[{ folderId }]];
+    if (sql.includes('FROM Treatment_Folder')) return [[{ folder_id: folderId }]];
+    if (sql.includes('FROM Folder_Membership WHERE folder_id = ? AND user_id = ?')) {
+      return [roles[args[1]] ? [{ membershipId: '1', role: roles[args[1]], status: 'ACTIVE' }] : []];
+    }
+    if (sql.includes('FROM Folder_Policy')) return [[{ policyVersion: 2, rotationStatus: null, deleting: 0 }]];
+    if (sql.startsWith('SELECT document_id FROM Document')) {
+      assert.match(sql, /FOR UPDATE$/);
+      return [[{ document_id: documentId }]];
+    }
+    return extra(sql, args, events);
+  };
+}
+
+test('metadata updates re-check the editor role and change only display fields', async () => {
+  const roles = { 5: 'OWNER', 7: 'EDITOR', 8: 'VIEWER' };
+  let update;
+  const { pool } = createFakeMysql(documentAccessHandler(roles, (sql, args) => {
+    if (sql.startsWith('UPDATE Document SET')) {
+      update = { sql, args };
+      return [{ affectedRows: 1 }];
+    }
+    assert.match(sql, /m\.role FROM Document AS d/);
+    return [[{ documentId, documentName: 'Đơn thuốc', category: 'PRESCRIPTION', role: roles[args[0]], currentVersionNumber: 1, ciphertextSize: '64' }]];
+  }));
+  const repository = createMysqlDocumentRepository(pool, { keyDirectory: {} });
+  assert.deepEqual(await repository.updateDocumentMetadata('8', documentId, { documentName: 'X' }), { code: 'FORBIDDEN' });
+  assert.deepEqual(await repository.updateDocumentMetadata('9', documentId, { documentName: 'X' }), { code: 'DOCUMENT_NOT_FOUND' });
+  assert.equal(update, undefined);
+  const result = await repository.updateDocumentMetadata('7', documentId, { documentName: 'Đơn thuốc', category: 'PRESCRIPTION' });
+  assert.equal(update.sql, 'UPDATE Document SET document_name = ?, category = ?, updated_at = UTC_TIMESTAMP(3) WHERE document_id = ?');
+  assert.deepEqual(update.args, ['Đơn thuốc', 'PRESCRIPTION', documentId]);
+  assert.equal(result.role, 'EDITOR');
+  assert.equal(result.ciphertextSize, 64);
+});
+
+test('document deletion is owner-only and removes rows children-first', async () => {
+  const roles = { 5: 'OWNER', 7: 'EDITOR' };
+  const { pool, events } = createFakeMysql(documentAccessHandler(roles, (sql, _args, events) => {
+    if (sql.startsWith('SELECT r.storage_object_key')) return [[{ objectKey: 'a/1' }, { objectKey: 'b/2' }]];
+    if (sql.startsWith('DELETE FROM Document_Version')) assert.match(sql, /ORDER BY version_number DESC$/);
+    events.push(sql.split(' ').slice(0, 3).join(' '));
+    return [{ affectedRows: 1 }];
+  }));
+  const repository = createMysqlDocumentRepository(pool, { keyDirectory: {} });
+  assert.deepEqual(await repository.deleteDocument('7', documentId), { code: 'FORBIDDEN' });
+  assert.deepEqual(await repository.deleteDocument('9', documentId), { code: 'DOCUMENT_NOT_FOUND' });
+  events.length = 0;
+  assert.deepEqual(await repository.deleteDocument('5', documentId), { objectKeys: ['a/1', 'b/2'] });
+  assert.deepEqual(events, [
+    'begin', 'DELETE e FROM', 'DELETE r FROM', 'UPDATE Document SET', 'DELETE FROM Document_Version',
+    'DELETE FROM Upload_Context', 'DELETE FROM Document', 'commit', 'release',
+  ]);
+});

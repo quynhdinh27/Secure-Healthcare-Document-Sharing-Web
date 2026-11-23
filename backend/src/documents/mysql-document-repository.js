@@ -229,6 +229,71 @@ async function publishVersion(connection, input, keyDirectory) {
   return { documentId: context.documentId, versionId: context.versionId, revisionId: context.revisionId, versionNumber };
 }
 
+// Shared start of document writes: find the folder, lock folder + membership,
+// check the role, then lock the document row.
+async function lockDocumentForAction(connection, userId, documentId, action) {
+  const folderId = await findDocumentFolder(connection, documentId);
+  if (!folderId) return { code: 'DOCUMENT_NOT_FOUND' };
+  const membership = await lockMembership(connection, folderId, userId);
+  if (!membership) return { code: 'DOCUMENT_NOT_FOUND' };
+  if (!hasFolderPermission(membership, action)) return { code: 'FORBIDDEN' };
+  const [[document]] = await connection.execute(
+    'SELECT document_id FROM Document WHERE document_id = ? FOR UPDATE', [documentId],
+  );
+  if (!document) return { code: 'DOCUMENT_NOT_FOUND' };
+  return { folderId };
+}
+
+async function updateMetadata(connection, userId, documentId, changes) {
+  const locked = await lockDocumentForAction(connection, userId, documentId, 'updateDocument');
+  if (locked.code) return locked;
+  const columns = [];
+  const values = [];
+  if (changes.documentName !== undefined) {
+    columns.push('document_name = ?');
+    values.push(changes.documentName);
+  }
+  if (changes.category !== undefined) {
+    columns.push('category = ?');
+    values.push(changes.category);
+  }
+  await connection.execute(
+    `UPDATE Document SET ${columns.join(', ')}, updated_at = UTC_TIMESTAMP(3) WHERE document_id = ?`,
+    [...values, documentId],
+  );
+  const [[row]] = await connection.execute(findDocumentQuery, [userId, documentId]);
+  return toDocument(row);
+}
+
+async function removeDocument(connection, userId, documentId) {
+  const locked = await lockDocumentForAction(connection, userId, documentId, 'deleteDocument');
+  if (locked.code) return locked;
+  const state = await readFolderState(connection, locked.folderId);
+  if (!state.ready) return { code: 'FOLDER_NOT_READY' };
+  const [objects] = await connection.execute(`
+    SELECT r.storage_object_key AS objectKey FROM Crypto_Revision AS r
+    INNER JOIN Document_Version AS v ON v.version_id = r.version_id
+    WHERE v.document_id = ?
+  `, [documentId]);
+  await connection.execute(`
+    DELETE e FROM DEK_Envelope AS e
+    INNER JOIN Crypto_Revision AS r ON r.revision_id = e.revision_id
+    INNER JOIN Document_Version AS v ON v.version_id = r.version_id
+    WHERE v.document_id = ?
+  `, [documentId]);
+  await connection.execute(`
+    DELETE r FROM Crypto_Revision AS r
+    INNER JOIN Document_Version AS v ON v.version_id = r.version_id
+    WHERE v.document_id = ?
+  `, [documentId]);
+  await connection.execute('UPDATE Document SET current_version_id = NULL WHERE document_id = ?', [documentId]);
+  // Newest first, so base_version_id references never point at an already deleted row.
+  await connection.execute('DELETE FROM Document_Version WHERE document_id = ? ORDER BY version_number DESC', [documentId]);
+  await connection.execute('DELETE FROM Upload_Context WHERE document_id = ?', [documentId]);
+  await connection.execute('DELETE FROM Document WHERE document_id = ?', [documentId]);
+  return { objectKeys: objects.map(({ objectKey }) => objectKey) };
+}
+
 function createMysqlDocumentRepository(pool, { keyDirectory, uploadContextTtlSeconds = 600 } = {}) {
   if (!keyDirectory) throw new Error('keyDirectory is required');
 
@@ -368,6 +433,14 @@ function createMysqlDocumentRepository(pool, { keyDirectory, uploadContextTtlSec
 
     publishUpload(input) {
       return inTransaction((connection) => publishVersion(connection, input, keyDirectory));
+    },
+
+    updateDocumentMetadata(userId, documentId, changes) {
+      return inTransaction((connection) => updateMetadata(connection, userId, documentId, changes));
+    },
+
+    deleteDocument(userId, documentId) {
+      return inTransaction((connection) => removeDocument(connection, userId, documentId));
     },
   };
 }
