@@ -79,6 +79,156 @@ async function findDocumentFolder(executor, documentId) {
   return row?.folderId ?? null;
 }
 
+const contextColumns = `
+  context_id AS contextId, purpose, folder_id AS folderId, CAST(user_id AS CHAR) AS userId,
+  document_id AS documentId, version_id AS versionId, revision_id AS revisionId,
+  base_version_id AS baseVersionId, version_number AS versionNumber,
+  policy_version AS policyVersion, signer_key_id AS signerKeyId, recipients,
+  consumed_at AS consumedAt, expires_at <= UTC_TIMESTAMP(3) AS expired
+`;
+
+async function issueUploadContext(connection, { userId, folderId, request, keyDirectory, ttlSeconds }) {
+  const membership = await lockMembership(connection, folderId, userId);
+  if (!hasFolderPermission(membership, 'upload')) return { code: 'FORBIDDEN' };
+  const state = await readFolderState(connection, folderId);
+  if (!state.ready) return { code: 'FOLDER_NOT_READY' };
+  const signer = await keyDirectory.getActiveSigningKey(connection, userId);
+  if (!signer) return { code: 'SIGNING_KEY_MISSING' };
+  let documentId = randomUUID();
+  let versionNumber = 1;
+  let baseVersionId = null;
+  if (request.purpose === 'NEW_VERSION') {
+    const [[document]] = await connection.execute(`
+      SELECT current_version_id AS currentVersionId FROM Document
+      WHERE document_id = ? AND folder_id = ? FOR UPDATE
+    `, [request.documentId, folderId]);
+    if (!document) return { code: 'DOCUMENT_NOT_FOUND' };
+    if (document.currentVersionId !== request.baseVersionId) {
+      return { code: 'VERSION_CONFLICT', currentVersionId: document.currentVersionId };
+    }
+    const [[latest]] = await connection.execute(
+      'SELECT MAX(version_number) AS versionNumber FROM Document_Version WHERE document_id = ?', [request.documentId],
+    );
+    documentId = request.documentId;
+    versionNumber = Number(latest.versionNumber) + 1;
+    baseVersionId = request.baseVersionId;
+  }
+  const [members] = await connection.execute(`
+    SELECT CAST(membership_id AS CHAR) AS membershipId, CAST(user_id AS CHAR) AS userId
+    FROM Folder_Membership WHERE folder_id = ? AND status = 'ACTIVE' ORDER BY user_id
+  `, [folderId]);
+  const recipients = [];
+  const missing = [];
+  for (const member of members) {
+    const key = await keyDirectory.getActiveEncryptionKey(connection, member.userId);
+    if (!key) missing.push(member.userId);
+    else recipients.push({ userId: member.userId, membershipId: member.membershipId, keyId: key.keyId, fingerprint: key.fingerprint, publicKeyJwk: key.publicKeyJwk });
+  }
+  if (missing.length) return { code: 'RECIPIENT_KEY_MISSING', userIds: missing };
+  const expiresAt = new Date(Date.now() + ttlSeconds * 1000);
+  const context = {
+    contextId: randomUUID(), purpose: request.purpose, folderId, documentId,
+    versionId: randomUUID(), revisionId: randomUUID(), versionNumber, baseVersionId,
+    policyVersion: state.policyVersion, signerKeyId: signer.keyId, expiresAt: expiresAt.toISOString(),
+  };
+  const storedRecipients = recipients.map(({ publicKeyJwk, ...recipient }) => recipient);
+  await connection.execute(`
+    INSERT INTO Upload_Context (context_id, folder_id, user_id, purpose, document_id, version_id,
+      revision_id, base_version_id, version_number, policy_version, signer_key_id, recipients, expires_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `, [
+    context.contextId, folderId, userId, context.purpose, documentId, context.versionId,
+    context.revisionId, baseVersionId, versionNumber, context.policyVersion, signer.keyId,
+    JSON.stringify(storedRecipients), toMysqlDateTime(expiresAt),
+  ]);
+  return { ...context, recipients };
+}
+
+async function publishVersion(connection, input, keyDirectory) {
+  const { userId, purpose } = input;
+  const hidden = purpose === 'NEW_VERSION' ? { code: 'DOCUMENT_NOT_FOUND' } : { code: 'FORBIDDEN' };
+  const folderId = purpose === 'NEW_VERSION' ? await findDocumentFolder(connection, input.documentId) : input.folderId;
+  if (!folderId) return hidden;
+  const membership = await lockMembership(connection, folderId, userId);
+  if (!membership) return hidden;
+  if (!hasFolderPermission(membership, 'upload')) return { code: 'FORBIDDEN' };
+  const [[stored]] = await connection.execute(`
+    SELECT ${contextColumns} FROM Upload_Context
+    WHERE context_id = ? AND folder_id = ? AND user_id = ? FOR UPDATE
+  `, [input.contextId, folderId, userId]);
+  if (!stored || stored.purpose !== purpose
+      || (purpose === 'NEW_VERSION' && stored.documentId !== input.documentId)) {
+    return { code: 'CONTEXT_NOT_FOUND' };
+  }
+  if (stored.consumedAt) return { code: 'CONTEXT_USED' };
+  if (Number(stored.expired)) return { code: 'CONTEXT_EXPIRED' };
+  const context = { ...stored, recipients: parseJson(stored.recipients) };
+  const state = await readFolderState(connection, folderId);
+  if (!state.ready) return { code: 'FOLDER_NOT_READY' };
+  if (state.policyVersion !== Number(context.policyVersion)) return { code: 'CONTEXT_STALE' };
+  const signer = await keyDirectory.getActiveSigningKey(connection, userId);
+  if (!signer || signer.keyId !== context.signerKeyId) return { code: 'SIGNING_KEY_MISSING' };
+  for (const recipient of context.recipients) {
+    const key = await keyDirectory.getActiveEncryptionKey(connection, recipient.userId);
+    if (key?.keyId !== recipient.keyId) return { code: 'CONTEXT_STALE' };
+  }
+  const verified = verifyDocumentUpload({
+    context,
+    manifest: input.manifest,
+    signature: input.signature,
+    envelopes: input.envelopes,
+    signerPublicJwk: signer.publicKeyJwk,
+    ciphertext: { sha256: input.ciphertextSha256, size: input.ciphertextSize },
+  });
+  if (verified.code) return verified;
+  if (purpose === 'NEW_VERSION') {
+    const [[document]] = await connection.execute(
+      'SELECT current_version_id AS currentVersionId FROM Document WHERE document_id = ? FOR UPDATE', [context.documentId],
+    );
+    if (!document) return { code: 'DOCUMENT_NOT_FOUND' };
+    if (document.currentVersionId !== context.baseVersionId) {
+      return { code: 'VERSION_CONFLICT', currentVersionId: document.currentVersionId };
+    }
+  } else {
+    await connection.execute(`
+      INSERT INTO Document (document_id, folder_id, document_name, category, original_uploader_id)
+      VALUES (?, ?, ?, ?, ?)
+    `, [context.documentId, folderId, input.documentName, input.category, userId]);
+  }
+  const versionNumber = Number(context.versionNumber);
+  await connection.execute(`
+    INSERT INTO Document_Version (version_id, document_id, version_number, base_version_id,
+      created_by, author_key_id, mime_type)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `, [context.versionId, context.documentId, versionNumber, context.baseVersionId, userId, signer.keyId, input.mimeType]);
+  await connection.execute(`
+    INSERT INTO Crypto_Revision (revision_id, version_id, revision_number, status, storage_object_key,
+      ciphertext_size, ciphertext_sha256, nonce, policy_version, signed_manifest, signer_key_id,
+      created_by, activated_at)
+    VALUES (?, ?, 1, 'ACTIVE', ?, ?, ?, ?, ?, ?, ?, ?, UTC_TIMESTAMP(3))
+  `, [
+    context.revisionId, context.versionId, input.objectKey, input.ciphertextSize, input.ciphertextSha256,
+    verified.nonce, Number(context.policyVersion), JSON.stringify({ manifest: input.manifest, signature: input.signature }),
+    signer.keyId, userId,
+  ]);
+  for (const envelope of verified.envelopes) {
+    await connection.execute(`
+      INSERT INTO DEK_Envelope (revision_id, recipient_user_id, recipient_membership_id, recipient_key_id, wrapped_dek)
+      VALUES (?, ?, ?, ?, ?)
+    `, [context.revisionId, envelope.userId, envelope.membershipId, envelope.keyId, envelope.wrappedDek]);
+  }
+  await connection.execute(
+    'UPDATE Document SET current_version_id = ?, updated_at = UTC_TIMESTAMP(3) WHERE document_id = ?',
+    [context.versionId, context.documentId],
+  );
+  const [consumed] = await connection.execute(
+    'UPDATE Upload_Context SET consumed_at = UTC_TIMESTAMP(3) WHERE context_id = ? AND consumed_at IS NULL',
+    [context.contextId],
+  );
+  if (consumed.affectedRows !== 1) throw new Error('Upload context was consumed concurrently');
+  return { documentId: context.documentId, versionId: context.versionId, revisionId: context.revisionId, versionNumber };
+}
+
 function createMysqlDocumentRepository(pool, { keyDirectory, uploadContextTtlSeconds = 600 } = {}) {
   if (!keyDirectory) throw new Error('keyDirectory is required');
 
@@ -208,6 +358,16 @@ function createMysqlDocumentRepository(pool, { keyDirectory, uploadContextTtlSec
         return { code: 'REVISION_CHANGED', revisionId: revision.revisionId };
       }
       return { revisionId: revision.revisionId, objectKey: revision.objectKey, ciphertextSize: Number(revision.ciphertextSize) };
+    },
+
+    createUploadContext(userId, folderId, request) {
+      return inTransaction((connection) => issueUploadContext(connection, {
+        userId, folderId, request, keyDirectory, ttlSeconds: uploadContextTtlSeconds,
+      }));
+    },
+
+    publishUpload(input) {
+      return inTransaction((connection) => publishVersion(connection, input, keyDirectory));
     },
   };
 }
