@@ -3,12 +3,16 @@ const { createFolderRouter } = require('./folders/folder-router');
 const { createMysqlFolderRepository } = require('./folders/mysql-folder-repository');
 const { createFolderPolicyVerifiers } = require('./folders/folder-policy-signatures');
 const { queueMysqlFolderRotation } = require('./folders/mysql-folder-rotation-queue');
+const { createDocumentRouter } = require('./documents/document-router');
+const { createMysqlDocumentRepository } = require('./documents/mysql-document-repository');
 
 function createApp({
   authenticate, mysqlPool, folderRepository, folderPolicyKeys,
   verifyInitialFolderPolicy, verifyFolderPolicy, queueFolderRotation, canReadRotationSources,
   verifyFolderDeletionReauth,
+  documentRepository, objectStorage, keyDirectory, maxUploadBytes, uploadContextTtlSeconds,
 } = {}) {
+  folderPolicyKeys ??= keyDirectory;
   const app = express();
 
   app.get('/health/live', (_request, response) => {
@@ -47,6 +51,14 @@ function createApp({
     && typeof folderPolicyKeys?.canReceiveFolderKeys === 'function'
     ? createFolderPolicyVerifiers(folderPolicyKeys)
     : {};
+  const documents = documentRepository ?? (mysqlPool && keyDirectory
+    ? createMysqlDocumentRepository(mysqlPool, { keyDirectory, uploadContextTtlSeconds })
+    : undefined);
+  // Mounted before the folders router: its routes (/folders/:id/documents, ...)
+  // would otherwise reach the folders router first.
+  app.use('/api/v1', createDocumentRouter({
+    authenticate, documentRepository: documents, objectStorage, maxUploadBytes,
+  }));
   app.use('/api/v1/folders', createFolderRouter({
     authenticate,
     folderRepository: repository,
