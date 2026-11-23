@@ -5,8 +5,11 @@
   "main": "index.js",
   "scripts": {
     "test": "node --test",
-    "start": "node src/server.js",
-    "migrate": "node scripts/migrate.cjs"
+    "start": "node src/main.js",
+    "migrate": "node scripts/migrate.cjs",
+    "seed": "node scripts/seed.cjs",
+    "dev:complete-rotations": "node scripts/dev-complete-rotations.cjs",
+    "smoke:documents": "node scripts/smoke-documents.cjs"
   },
   "keywords": [],
   "author": "",
