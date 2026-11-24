@@ -18,19 +18,37 @@ function readInteger(env, name, fallback, min, max) {
   return Number(raw);
 }
 
+function readBoolean(env, name, fallback) {
+  const raw = env[name];
+  if (raw === undefined) return fallback;
+  if (raw === 'true') return true;
+  if (raw === 'false') return false;
+  throw new Error(`${name} must be 'true' or 'false'`);
+}
+
 function loadConfig(env = process.env) {
   const nodeEnv = env.NODE_ENV || 'development';
-  const authMode = env.AUTH_MODE || 'dev';
+  const authMode = env.AUTH_MODE || 'session';
   const storageDriver = env.STORAGE_DRIVER || 'local';
-  if (authMode !== 'dev') throw new Error('AUTH_MODE must be one of: dev');
+  if (authMode !== 'session' && authMode !== 'dev') {
+    throw new Error('AUTH_MODE must be one of: session, dev');
+  }
   if (authMode === 'dev' && nodeEnv === 'production') {
     throw new Error('AUTH_MODE=dev is not allowed when NODE_ENV=production');
   }
-  if (storageDriver !== 'local') throw new Error('STORAGE_DRIVER must be one of: local');
-  if (!env.DB_PASSWORD) throw new Error('DB_PASSWORD is required');
+  if (storageDriver !== 'local') {
+    throw new Error('STORAGE_DRIVER must be one of: local');
+  }
+  if (!env.DB_PASSWORD) {
+    throw new Error('DB_PASSWORD is required');
+  }
   return Object.freeze({
     nodeEnv,
     port: readInteger(env, 'PORT', 3000, 1, 65535),
+    authMode,
+    sessionTtlMs: readInteger(env, 'SESSION_TTL_MS', 8 * 60 * 60 * 1000, 60_000, 7 * 24 * 60 * 60 * 1000),
+    reauthTtlMs: readInteger(env, 'REAUTH_TTL_MS', 5 * 60 * 1000, 1_000, 60 * 60 * 1000),
+    cookieSecure: readBoolean(env, 'COOKIE_SECURE', true),
     db: Object.freeze({
       host: env.DB_HOST || '127.0.0.1',
       port: readInteger(env, 'DB_PORT', 3306, 1, 65535),
@@ -38,7 +56,6 @@ function loadConfig(env = process.env) {
       password: env.DB_PASSWORD,
       database: env.DB_NAME || 'medshare',
     }),
-    authMode,
     storage: Object.freeze({
       driver: storageDriver,
       dir: path.resolve(backendDir, env.STORAGE_DIR || 'data/objects'),

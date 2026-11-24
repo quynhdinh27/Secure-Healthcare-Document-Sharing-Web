@@ -111,7 +111,7 @@ async function createFolderWithMembers({ call, owner, folder, members = [] }) {
 }
 
 async function startDevServer({ config, pool }) {
-  const server = buildApp({ config, pool }).listen(0, '127.0.0.1');
+  const server = buildApp({ config: { ...config, authMode: 'dev' }, pool }).listen(0, '127.0.0.1');
   await once(server, 'listening');
   return {
     baseUrl: `http://127.0.0.1:${server.address().port}/api/v1`,
