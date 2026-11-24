@@ -1,0 +1,7 @@
+export { beginKeyEnrollment, answerKeyChallenge, finalizeLocalKey, restorePrivateKey } from './keys/enrollment.js'
+export { saveLocalKey, loadLocalKey, removeLocalKey } from './keys/storage.js'
+export { signFolderPolicy, signInitialFolderPolicy, verifyFolderPolicy } from './keys/policy.js'
+export { prepareUpload } from './documents/upload.js'
+export { openDocument } from './documents/download.js'
+export { prepareRotationItem } from './rotation/reencrypt-version.js'
+export { prepareRotationCommit } from './rotation/commit.js'
