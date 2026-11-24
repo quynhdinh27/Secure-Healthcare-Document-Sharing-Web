@@ -1,0 +1,21 @@
+import React from 'react';
+import { createRoot } from 'react-dom/client';
+import { BrowserRouter } from 'react-router-dom';
+import App from './App';
+import { AuthProvider } from './auth/AuthContext';
+import { ReauthProvider, ToastProvider } from './components/Providers';
+import './styles.css';
+
+createRoot(document.getElementById('root')).render(
+  <React.StrictMode>
+    <BrowserRouter>
+      <ToastProvider>
+        <AuthProvider>
+          <ReauthProvider>
+            <App />
+          </ReauthProvider>
+        </AuthProvider>
+      </ToastProvider>
+    </BrowserRouter>
+  </React.StrictMode>,
+);

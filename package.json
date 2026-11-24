@@ -1,0 +1,26 @@
+{
+  "name": "medshare-frontend",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "test:crypto": "node --test test-crypto/crypto.test.js",
+    "test:e2e": "node test-e2e/run.mjs",
+    "test": "npm run test:crypto && npm run test:e2e"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-router-dom": "^6.28.0",
+    "hash-wasm": "^4.12.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.3.4",
+    "vite": "^5.4.11",
+    "fake-indexeddb": "^6.0.0",
+    "esbuild": "^0.21.5"
+  }
+}
