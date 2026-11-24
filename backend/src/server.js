@@ -3,6 +3,8 @@ const { createFolderRouter } = require('./folders/folder-router');
 const { createMysqlFolderRepository } = require('./folders/mysql-folder-repository');
 const { createFolderPolicyVerifiers } = require('./folders/folder-policy-signatures');
 const { queueMysqlFolderRotation } = require('./folders/mysql-folder-rotation-queue');
+const { createDocumentRouter } = require('./documents/document-router');
+const { createMysqlDocumentRepository } = require('./documents/mysql-document-repository');
 const { createInMemoryAuditRepository } = require('./audit/in-memory-audit-repository');
 const { createMysqlAuditRepository } = require('./audit/mysql-audit-repository');
 const { createAuditService } = require('./audit/audit-service');
@@ -39,6 +41,11 @@ function createApp({
   queueFolderRotation,
   canReadRotationSources,
   verifyFolderDeletionReauth,
+  documentRepository,
+  objectStorage,
+  keyDirectory,
+  maxUploadBytes,
+  uploadContextTtlSeconds,
   authEnabled,
   authService,
   userService,
@@ -49,6 +56,7 @@ function createApp({
   sessionTtlMs = 8 * 60 * 60 * 1000,
   reauthTtlMs = 5 * 60 * 1000,
 } = {}) {
+  folderPolicyKeys ??= keyDirectory;
   const app = express();
   const resolvedCookieSecure = cookieSecure ?? true;
 
@@ -160,6 +168,22 @@ function createApp({
     && typeof folderPolicyKeys?.canReceiveFolderKeys === 'function'
     ? createFolderPolicyVerifiers(folderPolicyKeys)
     : {};
+  const documents = documentRepository ?? (mysqlPool && keyDirectory
+    ? createMysqlDocumentRepository(mysqlPool, { keyDirectory, uploadContextTtlSeconds })
+    : undefined);
+
+  // Mounted before the folders router: its routes (/folders/:id/documents, ...)
+  // would otherwise reach the folders router first.
+  const documentAuth = useDefaultAuth
+    ? [defaultAuthenticate, defaultRequireCsrf, adminFolderMutationGuard]
+    : authenticate;
+  app.use('/api/v1', createDocumentRouter({
+    authenticate: documentAuth,
+    documentRepository: documents,
+    objectStorage,
+    maxUploadBytes,
+  }));
+
   const folderRouterOptions = {
     folderRepository: repository,
     verifyInitialFolderPolicy: verifyInitialFolderPolicy ?? policyVerifiers.verifyInitialFolderPolicy,

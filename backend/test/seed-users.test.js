@@ -83,7 +83,8 @@ test('seedUsers creates 5 departments and 16 distinct-password accounts idempote
 
 test('loadConfig validates DB_PASSWORD, AUTH_MODE, COOKIE_SECURE, and TTL bounds', () => {
   assert.throws(() => loadConfig({}), /DB_PASSWORD is required/);
-  assert.throws(() => loadConfig({ DB_PASSWORD: 'pw', AUTH_MODE: 'dev' }), /AUTH_MODE must be: session/);
+  assert.throws(() => loadConfig({ DB_PASSWORD: 'pw', AUTH_MODE: 'invalid' }), /AUTH_MODE must be one of: session, dev/);
+  assert.throws(() => loadConfig({ DB_PASSWORD: 'pw', NODE_ENV: 'production', AUTH_MODE: 'dev' }), /AUTH_MODE=dev is not allowed/);
   assert.throws(() => loadConfig({ DB_PASSWORD: 'pw', COOKIE_SECURE: 'yes' }), /COOKIE_SECURE must be/);
 
   const cfg = loadConfig({ DB_PASSWORD: 'pw', COOKIE_SECURE: 'false', PORT: '4000' });

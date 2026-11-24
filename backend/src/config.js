@@ -29,8 +29,15 @@ function readBoolean(env, name, fallback) {
 function loadConfig(env = process.env) {
   const nodeEnv = env.NODE_ENV || 'development';
   const authMode = env.AUTH_MODE || 'session';
-  if (authMode !== 'session') {
-    throw new Error('AUTH_MODE must be: session');
+  const storageDriver = env.STORAGE_DRIVER || 'local';
+  if (authMode !== 'session' && authMode !== 'dev') {
+    throw new Error('AUTH_MODE must be one of: session, dev');
+  }
+  if (authMode === 'dev' && nodeEnv === 'production') {
+    throw new Error('AUTH_MODE=dev is not allowed when NODE_ENV=production');
+  }
+  if (storageDriver !== 'local') {
+    throw new Error('STORAGE_DRIVER must be one of: local');
   }
   if (!env.DB_PASSWORD) {
     throw new Error('DB_PASSWORD is required');
@@ -49,6 +56,12 @@ function loadConfig(env = process.env) {
       password: env.DB_PASSWORD,
       database: env.DB_NAME || 'medshare',
     }),
+    storage: Object.freeze({
+      driver: storageDriver,
+      dir: path.resolve(backendDir, env.STORAGE_DIR || 'data/objects'),
+    }),
+    maxUploadBytes: readInteger(env, 'MAX_UPLOAD_MB', 25, 1, 1024) * 1024 * 1024,
+    uploadContextTtlSeconds: readInteger(env, 'UPLOAD_CONTEXT_TTL_SECONDS', 600, 60, 3600),
   });
 }
 

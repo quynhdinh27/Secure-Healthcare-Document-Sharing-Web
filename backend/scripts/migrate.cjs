@@ -1,4 +1,6 @@
 // Applies migrations/*.sql in lexicographic filename order and records each in schema_migrations.
+// MySQL DDL auto-commits: if a file fails halfway, fix it by hand or reset the
+// dev database (docker compose down -v).
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const { backendDir, loadConfig, loadDotEnv } = require('../src/config');
