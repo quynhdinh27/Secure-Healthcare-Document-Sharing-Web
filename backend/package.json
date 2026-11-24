@@ -5,7 +5,9 @@
   "main": "index.js",
   "scripts": {
     "test": "node --test",
-    "start": "node src/server.js"
+    "start": "node src/main.js",
+    "migrate": "node scripts/migrate.cjs",
+    "seed:users": "node scripts/seed-users.cjs"
   },
   "keywords": [],
   "author": "",
@@ -13,6 +15,7 @@
   "type": "commonjs",
   "dependencies": {
     "canonicalize": "2.1.0",
-    "express": "^5.3.0"
+    "express": "^5.3.0",
+    "mysql2": "^3.24.6"
   }
 }
