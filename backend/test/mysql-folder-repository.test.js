@@ -292,6 +292,10 @@ test('member revocation commits policy and rotation together and rolls back if r
       if (sql.includes('FROM Folder_Membership')) return [[{ membershipId: '1' }]];
       if (sql.includes('FROM Folder_Policy_Context')) return [[{ payload: context, expired }]];
       if (sql.includes('MAX(policy_version)')) return [[{ version: 1 }]];
+      if (sql.includes('AS hasDocuments')) {
+        assert.deepEqual(args, ['A']);
+        return [[{ hasDocuments: 1 }]];
+      }
       if (sql.startsWith('UPDATE Folder_Membership')) {
         assert.deepEqual(args, ['7', 'A', '2']);
         events.push('revoke');
@@ -304,7 +308,7 @@ test('member revocation commits policy and rotation together and rolls back if r
       } else if (sql.includes('INSERT INTO Folder_Rotation_Job')) {
         [rotationId] = args;
         assert.match(rotationId, /^[0-9a-f-]{36}$/);
-        assert.deepEqual(args.slice(1), ['A', 2, '7', 'REVOKE_MEMBER']);
+        assert.deepEqual(args.slice(1), ['A', 2, '7', 'REVOKE_MEMBER', 'PENDING', 'PENDING']);
         events.push('queue new job');
         if (failRotation) throw new Error('queue failed');
       }

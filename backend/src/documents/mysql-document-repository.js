@@ -52,10 +52,13 @@ async function readFolderState(executor, folderId) {
     FROM (SELECT MAX(policy_version) AS policyVersion FROM Folder_Policy WHERE folder_id = ?) AS p
   `, [folderId, folderId, folderId]);
   const policyVersion = Number(row?.policyVersion ?? 0);
+  return { policyVersion, ready: isFolderReady(row) };
+}
+
+function isFolderReady(row) {
   const rotationStatus = row?.rotationStatus ?? null;
-  const ready = policyVersion > 0 && Number(row?.deleting ?? 1) === 0
+  return Number(row?.policyVersion ?? 0) > 0 && Number(row?.deleting ?? 1) === 0
     && (rotationStatus === null || rotationStatus === 'COMPLETED');
-  return { policyVersion, ready };
 }
 
 // Lock order for every write: Treatment_Folder, then Folder_Membership, then
@@ -314,23 +317,30 @@ function createMysqlDocumentRepository(pool, { keyDirectory, uploadContextTtlSec
   }
 
   async function findReadableRevision(userId, versionId) {
-    const [[version]] = await pool.execute(`
-      SELECT v.version_id AS versionId, d.document_id AS documentId, d.folder_id AS folderId, m.role, m.status
+    const [[row]] = await pool.execute(`
+      SELECT v.version_id AS versionId, d.document_id AS documentId, d.folder_id AS folderId,
+             m.role, m.status, p.policy_version AS policyVersion, j.status AS rotationStatus,
+             o.folder_id IS NOT NULL AS deleting, r.revision_id AS revisionId,
+             r.storage_object_key AS objectKey, r.ciphertext_size AS ciphertextSize,
+             r.signer_key_id AS signerKeyId, r.signed_manifest AS signedManifest,
+             e.recipient_key_id AS recipientKeyId, e.wrapped_dek AS wrappedDek
       FROM Document_Version AS v INNER JOIN Document AS d ON d.document_id = v.document_id
       ${callerMembershipJoin}
+      LEFT JOIN Folder_Policy AS p ON p.folder_id = d.folder_id AND p.policy_version = (
+        SELECT MAX(p2.policy_version) FROM Folder_Policy AS p2 WHERE p2.folder_id = d.folder_id
+      )
+      LEFT JOIN Folder_Rotation_Job AS j ON j.folder_id = p.folder_id AND j.policy_version = p.policy_version
+      LEFT JOIN Folder_Deletion_Operation AS o ON o.folder_id = d.folder_id
+      LEFT JOIN Crypto_Revision AS r ON r.version_id = v.version_id AND r.status = 'ACTIVE'
+      LEFT JOIN DEK_Envelope AS e ON e.revision_id = r.revision_id
+        AND e.recipient_user_id = m.user_id AND e.recipient_membership_id = m.membership_id
       WHERE v.version_id = ?
     `, [userId, versionId]);
-    if (!hasFolderPermission(version, 'read')) return { code: 'VERSION_NOT_FOUND' };
-    const state = await readFolderState(pool, version.folderId);
-    if (!state.ready) return { code: 'FOLDER_NOT_READY' };
-    const [[revision]] = await pool.execute(`
-      SELECT r.revision_id AS revisionId, r.storage_object_key AS objectKey,
-             r.ciphertext_size AS ciphertextSize, r.signer_key_id AS signerKeyId,
-             r.signed_manifest AS signedManifest
-      FROM Crypto_Revision AS r WHERE r.version_id = ? AND r.status = 'ACTIVE'
-    `, [versionId]);
-    if (!revision) return { code: 'VERSION_NOT_FOUND' };
-    return { version, revision };
+    if (!hasFolderPermission(row, 'read')) return { code: 'VERSION_NOT_FOUND' };
+    if (!isFolderReady(row)) return { code: 'FOLDER_NOT_READY' };
+    if (!row.revisionId) return { code: 'VERSION_NOT_FOUND' };
+    if (!row.recipientKeyId) return { code: 'ENVELOPE_NOT_AVAILABLE' };
+    return row;
   }
 
   return {
@@ -395,34 +405,27 @@ function createMysqlDocumentRepository(pool, { keyDirectory, uploadContextTtlSec
     async getVersionManifestForUser(userId, versionId) {
       const access = await findReadableRevision(userId, versionId);
       if (access.code) return access;
-      const { version, revision } = access;
-      const [[envelope]] = await pool.execute(`
-        SELECT recipient_key_id AS keyId, wrapped_dek AS wrappedDek
-        FROM DEK_Envelope WHERE revision_id = ? AND recipient_user_id = ?
-      `, [revision.revisionId, userId]);
-      if (!envelope) return { code: 'ENVELOPE_NOT_AVAILABLE' };
-      const signer = await keyDirectory.getSigningKeyById(pool, revision.signerKeyId);
-      const { manifest, signature } = parseJson(revision.signedManifest);
+      const signer = await keyDirectory.getSigningKeyById(pool, access.signerKeyId);
+      const { manifest, signature } = parseJson(access.signedManifest);
       return {
-        versionId: version.versionId,
-        documentId: version.documentId,
-        folderId: version.folderId,
-        revisionId: revision.revisionId,
+        versionId: access.versionId,
+        documentId: access.documentId,
+        folderId: access.folderId,
+        revisionId: access.revisionId,
         manifest,
         signature,
         signer: { userId: signer.userId, keyId: signer.keyId, publicKeyJwk: signer.publicKeyJwk },
-        envelope: { keyId: envelope.keyId, wrappedDek: Buffer.from(envelope.wrappedDek).toString('base64url') },
+        envelope: { keyId: access.recipientKeyId, wrappedDek: Buffer.from(access.wrappedDek).toString('base64url') },
       };
     },
 
     async getVersionContentForUser(userId, versionId, revisionId) {
       const access = await findReadableRevision(userId, versionId);
       if (access.code) return access;
-      const { revision } = access;
-      if (revisionId && revisionId !== revision.revisionId) {
-        return { code: 'REVISION_CHANGED', revisionId: revision.revisionId };
+      if (revisionId && revisionId !== access.revisionId) {
+        return { code: 'REVISION_CHANGED', revisionId: access.revisionId };
       }
-      return { revisionId: revision.revisionId, objectKey: revision.objectKey, ciphertextSize: Number(revision.ciphertextSize) };
+      return { revisionId: access.revisionId, objectKey: access.objectKey, ciphertextSize: Number(access.ciphertextSize) };
     },
 
     createUploadContext(userId, folderId, request) {

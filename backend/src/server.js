@@ -3,6 +3,8 @@ const { createFolderRouter } = require('./folders/folder-router');
 const { createMysqlFolderRepository } = require('./folders/mysql-folder-repository');
 const { createFolderPolicyVerifiers } = require('./folders/folder-policy-signatures');
 const { queueMysqlFolderRotation } = require('./folders/mysql-folder-rotation-queue');
+const { canReadRotationSources: mysqlRotationSourceCheck, createMysqlRotationRepository } = require('./rotations/mysql-rotation-repository');
+const { createRotationWorkRouter } = require('./rotations/rotation-router');
 const { createDocumentRouter } = require('./documents/document-router');
 const { createMysqlDocumentRepository } = require('./documents/mysql-document-repository');
 const { createInMemoryAuditRepository } = require('./audit/in-memory-audit-repository');
@@ -229,6 +231,10 @@ function createApp({
     response.json(await repository.getDashboardSummary(request.user.id));
   });
   app.use('/api/v1/dashboard', dashboard);
+  const rotationWork = mysqlPool && !folderRepository && keyDirectory && objectStorage
+    ? createMysqlRotationRepository(mysqlPool, keyDirectory)
+    : undefined;
+  canReadRotationSources ??= rotationWork && mysqlRotationSourceCheck;
   const rotations = express.Router();
   if (routeAuth) rotations.use(routeAuth);
   if (useDefaultAuth) rotations.use(defaultRequireCsrf, adminFolderMutationGuard);
@@ -262,9 +268,18 @@ function createApp({
     if (typeof repository?.findRotationForUser !== 'function') {
       return response.status(503).json({ code: 'FOLDER_SERVICE_UNAVAILABLE' });
     }
-    const rotation = await repository.findRotationForUser(request.user.id, request.params.rotationId);
+    const rotation = await repository.findRotationForUser(
+      request.user.id, request.params.rotationId, { includeProgress: Boolean(rotationWork) },
+    );
     if (!rotation) return response.status(404).json({ code: 'ROTATION_NOT_FOUND' });
-    response.json(rotation);
+    if (!rotationWork) return response.json(rotation);
+    const { canReview, leaseActive, ...details } = rotation;
+    if (details.status !== 'IN_PROGRESS' || !leaseActive || !canReview) return response.json(details);
+    const progress = await rotationWork.readProgress({
+      rotationId: details.rotationId, generation: details.generation, userId: String(request.user.id),
+    });
+    if (progress.code) return response.json(details);
+    return response.json({ ...details, ...progress, canClaim: details.canClaim && progress.done < progress.total });
   });
   rotations.post('/:rotationId/claim', async function claimRotation(request, response) {
     if (typeof canReadRotationSources !== 'function' || typeof repository?.claimRotationForUser !== 'function') {
@@ -290,6 +305,11 @@ function createApp({
     if (result.code) return response.status(409).json(result);
     response.json(result);
   });
+  if (rotationWork) {
+    rotations.use('/:rotationId', createRotationWorkRouter({
+      repository: rotationWork, objectStorage, maxUploadBytes,
+    }));
+  }
   app.use('/api/v1/key-rotations', rotations);
 
   const operations = express.Router();

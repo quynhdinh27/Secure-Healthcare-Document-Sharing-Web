@@ -7,7 +7,6 @@ const { createPool } = require('../src/main');
 const {
   createApiClient, createDevUser, createFolderWithMembers, startDevServer, writeDevKeyFile,
 } = require('./lib/dev-accounts.cjs');
-const { completeFolderRotations } = require('./dev-complete-rotations.cjs');
 
 const DEV_KEYS_DIR = path.join(backendDir, 'data', 'dev-keys');
 
@@ -55,7 +54,6 @@ async function main() {
     const roles = new Map(staff.map((user) => [user.userId, []]));
     for (const entry of folders) {
       const folderId = await createFolderWithMembers({ call, ...entry });
-      await completeFolderRotations(pool, folderId);
       roles.get(entry.owner.userId).push(`OWNER ${entry.folder.name} (${folderId})`);
       for (const { user, role } of entry.members) roles.get(user.userId).push(`${role} ${entry.folder.name}`);
     }

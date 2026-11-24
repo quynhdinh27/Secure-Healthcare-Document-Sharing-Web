@@ -4,6 +4,7 @@ const canonicalize = require('canonicalize');
 // Pure checks of the signed CryptoManifest and DEK envelopes against an issued
 // upload context (spec section 7.3-7.4). No database access.
 const MANIFEST_PURPOSE = 'DOCUMENT_VERSION_UPLOAD';
+const ROTATION_PURPOSE = 'DOCUMENT_ROTATION_RESULT';
 const WRAPPED_DEK_BYTES = 384;
 const NONCE_BYTES = 12;
 const GCM_TAG_BYTES = 16;
@@ -54,8 +55,11 @@ function contextBoundFields(context) {
 
 function checkManifest(context, manifest) {
   const mismatch = { code: 'MANIFEST_MISMATCH' };
-  if (!hasExactKeys(manifest, manifestKeys)) return mismatch;
+  const rotating = context.rotation !== undefined;
   const bound = contextBoundFields(context);
+  const keys = rotating ? [...manifestKeys, 'generation', 'sourceRevisionId', 'sourceManifestSha256'] : manifestKeys;
+  if (!hasExactKeys(manifest, keys)) return mismatch;
+  if (rotating) Object.assign(bound, context.rotation, { purpose: ROTATION_PURPOSE });
   if (Object.entries(bound).some(([key, value]) => manifest[key] !== value)) return mismatch;
   if (!hasExactKeys(manifest.aead, ['alg', 'nonce']) || manifest.aead.alg !== 'AES-256-GCM') return mismatch;
   const nonce = decodeBase64url(manifest.aead.nonce);
@@ -126,4 +130,4 @@ function verifyDocumentUpload({ context, manifest, signature, envelopes, signerP
   return { nonce: checked.nonce, envelopes: accepted.envelopes };
 }
 
-module.exports = { MANIFEST_PURPOSE, WRAPPED_DEK_BYTES, verifyDocumentUpload };
+module.exports = { MANIFEST_PURPOSE, ROTATION_PURPOSE, WRAPPED_DEK_BYTES, sha256Hex, verifyDocumentUpload, verifyManifestSignature };

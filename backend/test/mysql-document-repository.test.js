@@ -50,21 +50,18 @@ test('version history lists retained business versions and marks the current one
 test('version downloads need a ready folder and return only the caller envelope', async () => {
   const state = { rotationStatus: null, deleting: 0, envelope: true };
   const { pool } = createFakeMysql((sql, args) => {
-    if (sql.includes('FROM Document_Version AS v INNER JOIN Document AS d')) {
-      return [args[0] === '7' && args[1] === versionId ? [{ versionId, documentId, folderId, role: 'VIEWER', status: 'ACTIVE' }] : []];
-    }
-    if (sql.includes('FROM Folder_Policy')) {
-      return [[{ policyVersion: 3, rotationStatus: state.rotationStatus, deleting: state.deleting }]];
-    }
-    if (sql.includes("FROM Crypto_Revision AS r WHERE r.version_id = ? AND r.status = 'ACTIVE'")) {
-      return [[{
-        revisionId, objectKey: `${revisionId}/obj`, ciphertextSize: '3', signerKeyId: 'signer-key',
-        signedManifest: { manifest: { versionId }, signature: 'sig' },
-      }]];
-    }
-    assert.match(sql, /FROM DEK_Envelope WHERE revision_id = \? AND recipient_user_id = \?$/);
-    assert.deepEqual(args, [revisionId, '7']);
-    return [state.envelope ? [{ keyId: 'enc-key', wrappedDek: Buffer.from([1, 2, 3]) }] : []];
+    assert.match(sql, /m\.user_id = \? AND m\.status = 'ACTIVE'/);
+    assert.match(sql, /r\.version_id = v\.version_id AND r\.status = 'ACTIVE'/);
+    assert.match(sql, /e\.recipient_user_id = m\.user_id AND e\.recipient_membership_id = m\.membership_id/);
+    assert.equal(args[1], versionId);
+    if (args[0] !== '7') return [[]];
+    return [[{
+      versionId, documentId, folderId, role: 'VIEWER', status: 'ACTIVE',
+      policyVersion: 3, rotationStatus: state.rotationStatus, deleting: state.deleting,
+      revisionId, objectKey: `${revisionId}/obj`, ciphertextSize: '3', signerKeyId: 'signer-key',
+      signedManifest: { manifest: { versionId }, signature: 'sig' },
+      recipientKeyId: state.envelope ? 'enc-key' : null, wrappedDek: Buffer.from([1, 2, 3]),
+    }]];
   });
   const keyDirectory = {
     async getSigningKeyById(executor, keyId) {
@@ -84,13 +81,15 @@ test('version downloads need a ready folder and return only the caller envelope'
   });
   assert.deepEqual(await repository.getVersionContentForUser('7', versionId, folderId), { code: 'REVISION_CHANGED', revisionId });
   assert.deepEqual(await repository.getVersionManifestForUser('8', versionId), { code: 'VERSION_NOT_FOUND' });
+  assert.deepEqual(await repository.getVersionContentForUser('8', versionId), { code: 'VERSION_NOT_FOUND' });
   state.envelope = false;
+  assert.deepEqual(await repository.getVersionContentForUser('7', versionId), { code: 'ENVELOPE_NOT_AVAILABLE' });
   assert.deepEqual(await repository.getVersionManifestForUser('7', versionId), { code: 'ENVELOPE_NOT_AVAILABLE' });
   for (const [rotationStatus, deleting] of [['PENDING', 0], ['WAITING_FOR_OWNER', 0], [null, 1]]) {
     Object.assign(state, { rotationStatus, deleting });
     assert.deepEqual(await repository.getVersionContentForUser('7', versionId), { code: 'FOLDER_NOT_READY' });
   }
-  Object.assign(state, { rotationStatus: 'COMPLETED', deleting: 0 });
+  Object.assign(state, { rotationStatus: 'COMPLETED', deleting: 0, envelope: true });
   assert.equal((await repository.getVersionContentForUser('7', versionId)).revisionId, revisionId);
 });
 
