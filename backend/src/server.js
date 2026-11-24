@@ -18,6 +18,9 @@ const { createMysqlUserRepository } = require('./users/mysql-user-repository');
 const { createUserService } = require('./users/user-service');
 const { createUsersRouter } = require('./users/users-router');
 const { createAdminUsersRouter } = require('./users/admin-users-router');
+const { createKeysRouter } = require('./keys/keys-router');
+const { createMysqlKeyEnrollmentRepository } = require('./keys/mysql-key-enrollment-repository');
+const { createMysqlKeyDirectory } = require('./keys/mysql-key-directory');
 
 const MUTATING_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
 
@@ -55,6 +58,7 @@ function createApp({
   cookieSecure = true,
   sessionTtlMs = 8 * 60 * 60 * 1000,
   reauthTtlMs = 5 * 60 * 1000,
+  keyEnrollmentRepository,
 } = {}) {
   folderPolicyKeys ??= keyDirectory;
   const app = express();
@@ -164,6 +168,14 @@ function createApp({
     : (useDefaultAuth ? defaultVerifyFolderDeletionReauth : verifyFolderDeletionReauth);
 
   const repository = folderRepository ?? (mysqlPool && createMysqlFolderRepository(mysqlPool));
+  const enrollmentRepository = keyEnrollmentRepository ?? (mysqlPool && createMysqlKeyEnrollmentRepository(mysqlPool));
+  if (useDefaultAuth && enrollmentRepository) {
+    app.use('/api/v1/users/me/keys', defaultAuthenticate, defaultRequireCsrf, createKeysRouter({
+      repository: enrollmentRepository,
+      verifyReauth: defaultVerifyFolderDeletionReauth,
+    }));
+  }
+  folderPolicyKeys ??= mysqlPool && createMysqlKeyDirectory();
   const policyVerifiers = typeof folderPolicyKeys?.lookupActiveSigningKey === 'function'
     && typeof folderPolicyKeys?.canReceiveFolderKeys === 'function'
     ? createFolderPolicyVerifiers(folderPolicyKeys)
