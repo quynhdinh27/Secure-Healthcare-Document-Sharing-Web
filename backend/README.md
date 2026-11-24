@@ -28,8 +28,14 @@ Ciphertext lưu trong `data/objects/` (`STORAGE_DRIVER=local`). Bản S3 sẽ l�
 | `npm test` | Unit/router test, không cần MySQL |
 | `npm run migrate` | Chạy các migration chưa chạy (ghi vào `schema_migrations`) |
 | `npm run seed` | Tạo dữ liệu dev (chỉ chạy một lần trên DB trống) |
-| `npm run smoke:documents` | Kiểm tra end-to-end Document Management trên MySQL |
-| `npm run dev:complete-rotations -- <folderId>` | **Chỉ dev.** Đánh dấu rotation job của folder là `COMPLETED`, vì rotation commit chưa có. Không mã hóa lại gì |
+| `npm run smoke:documents` | Kiểm tra upload, giải mã và xoay khóa sau khi thêm hoặc thu hồi thành viên trên MySQL |
+| `npm run dev:complete-rotations -- <folderId>` | **Chỉ dev.** Hoàn tất rotation job cũ của folder trống. Folder có tài liệu phải chờ luồng xoay khóa |
+
+## Xoay khóa tài liệu
+
+Sau khi chạy migration 020, Owner hoặc Editor có envelope nguồn cho mọi phiên bản có thể nhận job trong **Key rotation log**. Trình duyệt giải mã nguồn, tạo DEK mới cho từng phiên bản và gửi bản mã kèm envelope cho thành viên hiện tại. Owner mở nguồn và kết quả để đối chiếu, rồi ký kích hoạt trong lúc lease còn hiệu lực. Nếu lease hết hạn, người xử lý nhận lại job và chuẩn bị kết quả cho generation mới.
+
+Các API xử lý dùng `generation` trên query string. Endpoint `/items` trả recipient JWK và danh sách phiên bản với con trỏ `nextCursor`. Endpoint `/source` và `/result` trả metadata và envelope của người gọi. Để đọc ciphertext, gửi thêm `content=1` và `revisionId` lấy từ metadata. Kết quả stage dùng multipart với hai trường `metadata` và `ciphertext`. Commit nhận chữ ký của Owner trên danh sách kết quả sắp theo `itemId`. Xem luồng ký và định dạng manifest trong `scripts/lib/dev-rotation-client.cjs`.
 
 ## Làm lại DB từ đầu
 

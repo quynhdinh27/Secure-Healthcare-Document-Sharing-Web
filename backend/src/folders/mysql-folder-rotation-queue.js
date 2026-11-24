@@ -12,11 +12,15 @@ async function cancelMysqlFolderRotations(connection, folderId) {
 
 async function queueMysqlFolderRotation({ connection, folderId, policyVersion, ownerId, action }) {
   await cancelMysqlFolderRotations(connection, folderId);
+  const [[{ hasDocuments }]] = await connection.execute(
+    'SELECT EXISTS (SELECT 1 FROM Document WHERE folder_id = ?) AS hasDocuments', [folderId],
+  );
+  const status = Number(hasDocuments) === 0 ? 'COMPLETED' : 'PENDING';
   const rotationId = randomUUID();
   await connection.execute(`
-    INSERT INTO Folder_Rotation_Job (rotation_id, folder_id, policy_version, requested_by, action)
-    VALUES (?, ?, ?, ?, ?)
-  `, [rotationId, folderId, policyVersion, ownerId, action]);
+    INSERT INTO Folder_Rotation_Job (rotation_id, folder_id, policy_version, requested_by, action, status, finished_at)
+    VALUES (?, ?, ?, ?, ?, ?, IF(? = 'COMPLETED', UTC_TIMESTAMP(3), NULL))
+  `, [rotationId, folderId, policyVersion, ownerId, action, status, status]);
   return rotationId;
 }
 

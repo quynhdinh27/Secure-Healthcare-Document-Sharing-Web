@@ -118,7 +118,7 @@ async function lockRotationForUser(connection, userId, rotationId) {
   // Use the same lock order as membership changes and job cancellation.
   await connection.execute('SELECT folder_id FROM Treatment_Folder WHERE folder_id = ? FOR UPDATE', [location.folderId]);
   const [[job]] = await connection.execute(`
-    SELECT j.folder_id AS folderId, j.policy_version AS policyVersion, j.status, j.generation,
+    SELECT j.folder_id AS folderId, j.policy_version AS policyVersion, j.status, j.generation, m.role,
            CAST(j.executor_id AS CHAR) AS executorId,
            j.lease_expires_at > UTC_TIMESTAMP(3) AS leaseActive,
            DATE_FORMAT(j.lease_expires_at, '%Y-%m-%dT%H:%i:%s.%fZ') AS leaseExpiresAt
@@ -461,14 +461,21 @@ function createMysqlFolderRepository(pool) {
       return { folderId, policyVersion: row.policyVersion, signedPolicy };
     },
 
-    async findRotationForUser(userId, rotationId) {
+    async findRotationForUser(userId, rotationId, { includeProgress = false } = {}) {
       const [[job]] = await pool.execute(`
-        SELECT ${rotationJobColumns}
+        SELECT ${rotationJobColumns}, j.generation, m.role,
+               j.executor_id = m.user_id AS isExecutor,
+               j.lease_expires_at > UTC_TIMESTAMP(3) AS leaseActive
         ${rotationJobMembership}
         WHERE j.rotation_id = ? AND m.user_id = ?
           AND m.status = 'ACTIVE' AND m.role IN ('OWNER', 'EDITOR')
       `, [rotationId, userId]);
-      return job ?? null;
+      if (!job) return null;
+      const { role, isExecutor, leaseActive, generation, ...details } = job;
+      if (!includeProgress) return details;
+      const canClaim = ['PENDING', 'WAITING_FOR_CLIENT'].includes(details.status)
+        || (details.status === 'IN_PROGRESS' && (!Number(leaseActive) || Number(isExecutor) === 1));
+      return { ...details, generation, canClaim, leaseActive: Number(leaseActive) === 1, canReview: role === 'OWNER' || Number(isExecutor) === 1 };
     },
 
     async listRotationsForUser(userId, page) {
@@ -553,4 +560,4 @@ function createMysqlFolderRepository(pool) {
   };
 }
 
-module.exports = { createMysqlFolderRepository };
+module.exports = { createMysqlFolderRepository, lockRotationForUser };

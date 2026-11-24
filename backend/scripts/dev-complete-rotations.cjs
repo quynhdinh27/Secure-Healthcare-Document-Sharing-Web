@@ -1,21 +1,34 @@
-// DEVELOPMENT ONLY. Rotation commit (commitRotation) is not implemented yet, so a
-// folder stays FOLDER_NOT_READY after any membership change. This marks the
-// folder's unfinished rotation jobs COMPLETED so local testing can continue.
-// It does not re-encrypt anything: new members get no envelopes for existing
-// documents and DEKs are not rotated. Remove once rotation commit exists.
+// DEVELOPMENT ONLY. Repairs unfinished jobs created before empty folders settled automatically.
 const { loadConfig, loadDotEnv } = require('../src/config');
 const { createPool } = require('../src/main');
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
-async function completeFolderRotations(executor, folderId) {
-  const [result] = await executor.execute(`
-    UPDATE Folder_Rotation_Job SET status = 'COMPLETED', finished_at = UTC_TIMESTAMP(3)
-    WHERE folder_id = ?
-      AND status IN ('PENDING', 'IN_PROGRESS', 'WAITING_FOR_CLIENT', 'WAITING_FOR_KEY', 'WAITING_FOR_OWNER')
-  `, [folderId]);
-  const [[documents]] = await executor.execute('SELECT COUNT(*) AS count FROM Document WHERE folder_id = ?', [folderId]);
-  return { completed: result.affectedRows, documentCount: Number(documents.count) };
+async function completeFolderRotations(pool, folderId) {
+  const connection = await pool.getConnection();
+  try {
+    await connection.beginTransaction();
+    const [[folder]] = await connection.execute(
+      'SELECT folder_id FROM Treatment_Folder WHERE folder_id = ? FOR UPDATE', [folderId],
+    );
+    if (!folder) throw new Error('Folder not found');
+    const [[{ hasDocuments }]] = await connection.execute(
+      'SELECT EXISTS (SELECT 1 FROM Document WHERE folder_id = ?) AS hasDocuments', [folderId],
+    );
+    if (Number(hasDocuments) !== 0) throw new Error('Cannot complete rotation for a folder with documents');
+    const [result] = await connection.execute(`
+      UPDATE Folder_Rotation_Job SET status = 'COMPLETED', finished_at = UTC_TIMESTAMP(3)
+      WHERE folder_id = ?
+        AND status IN ('PENDING', 'IN_PROGRESS', 'WAITING_FOR_CLIENT', 'WAITING_FOR_KEY', 'WAITING_FOR_OWNER')
+    `, [folderId]);
+    await connection.commit();
+    return result.affectedRows;
+  } catch (error) {
+    await connection.rollback();
+    throw error;
+  } finally {
+    connection.release();
+  }
 }
 
 async function main() {
@@ -28,11 +41,8 @@ async function main() {
   if (config.nodeEnv === 'production') throw new Error('dev:complete-rotations is not allowed in production');
   const pool = createPool(config.db);
   try {
-    const { completed, documentCount } = await completeFolderRotations(pool, folderId);
+    const completed = await completeFolderRotations(pool, folderId);
     console.log(`Marked ${completed} rotation job(s) COMPLETED for folder ${folderId}`);
-    if (documentCount > 0) {
-      console.warn(`Warning: the folder has ${documentCount} document(s). Members added since the last upload have no envelope (ENVELOPE_NOT_AVAILABLE) and DEKs were not rotated.`);
-    }
   } finally {
     await pool.end();
   }

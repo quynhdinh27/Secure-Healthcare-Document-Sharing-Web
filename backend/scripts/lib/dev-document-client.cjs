@@ -20,7 +20,7 @@ function oaepLabelFor({ folderId, documentId, versionId, revisionId }, recipient
   return Buffer.from(canonicalize({ purpose: 'DEK_ENVELOPE', folderId, documentId, versionId, revisionId, recipientKeyId }));
 }
 
-async function prepareUpload({ context, author, plaintext, documentName, category, mimeType }) {
+async function prepareUpload({ context, author, plaintext, documentName, category, mimeType, sourceManifest }) {
   const dek = await subtle.generateKey({ name: 'AES-GCM', length: 256 }, true, ['encrypt']);
   const nonce = webcrypto.getRandomValues(new Uint8Array(12));
   const ciphertext = Buffer.from(await subtle.encrypt(
@@ -59,6 +59,15 @@ async function prepareUpload({ context, author, plaintext, documentName, categor
       userId, keyId, wrappedDekSha256: sha256Hex(Buffer.from(wrappedDek, 'base64url')),
     })),
   };
+  if (sourceManifest) {
+    Object.assign(manifest, {
+      purpose: 'DOCUMENT_ROTATION_RESULT',
+      generation: context.generation,
+      sourceRevisionId: sourceManifest.revisionId,
+      sourceManifestSha256: sha256Hex(canonicalize(sourceManifest)),
+      authorRecordSha256: sourceManifest.authorRecordSha256,
+    });
+  }
   const signature = await signPayload(author.keys.signing.privateJwk, manifest);
   const form = new FormData();
   form.append('metadata', JSON.stringify({ contextId: context.contextId, documentName, category, mimeType, manifest, signature, envelopes }));
@@ -68,6 +77,11 @@ async function prepareUpload({ context, author, plaintext, documentName, categor
 
 async function downloadAndDecrypt({ call, user, versionId }) {
   const evidence = await call(`/versions/${versionId}/manifest`, user.userId, 200);
+  const { data } = await call(`/versions/${versionId}/content?revisionId=${evidence.revisionId}`, user.userId, 200, { raw: true });
+  return verifyAndDecrypt(evidence, data, user);
+}
+
+async function verifyAndDecrypt(evidence, data, user) {
   const signerKey = await subtle.importKey('jwk', evidence.signer.publicKeyJwk, { name: 'ECDSA', namedCurve: 'P-256' }, false, ['verify']);
   const validSignature = await subtle.verify(
     { name: 'ECDSA', hash: 'SHA-256' }, signerKey,
@@ -80,7 +94,6 @@ async function downloadAndDecrypt({ call, user, versionId }) {
     privateKey, Buffer.from(evidence.envelope.wrappedDek, 'base64url'),
   );
   const dek = await subtle.importKey('raw', rawDek, 'AES-GCM', false, ['decrypt']);
-  const { data } = await call(`/versions/${versionId}/content?revisionId=${evidence.revisionId}`, user.userId, 200, { raw: true });
   assert.equal(sha256Hex(data), evidence.manifest.ciphertextSha256, 'ciphertext hash matches the manifest');
   return Buffer.from(await subtle.decrypt({
     name: 'AES-GCM', iv: Buffer.from(evidence.manifest.aead.nonce, 'base64url'),
@@ -88,4 +101,4 @@ async function downloadAndDecrypt({ call, user, versionId }) {
   }, dek, data));
 }
 
-module.exports = { downloadAndDecrypt, prepareUpload };
+module.exports = { downloadAndDecrypt, prepareUpload, sha256Hex, verifyAndDecrypt };

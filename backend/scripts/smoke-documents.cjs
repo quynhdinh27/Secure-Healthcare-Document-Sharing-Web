@@ -7,9 +7,10 @@ const path = require('node:path');
 const { loadConfig, loadDotEnv } = require('../src/config');
 const { createPool } = require('../src/main');
 const {
-  addFolderMember, createApiClient, createDevUser, createFolderWithMembers, startDevServer,
+  addFolderMember, createApiClient, createDevUser, createFolderWithMembers, signPayload, startDevServer,
 } = require('./lib/dev-accounts.cjs');
 const { downloadAndDecrypt, prepareUpload } = require('./lib/dev-document-client.cjs');
+const { completeRotation } = require('./lib/dev-rotation-client.cjs');
 const { completeFolderRotations } = require('./dev-complete-rotations.cjs');
 
 async function main() {
@@ -34,9 +35,6 @@ async function main() {
     const contextsPath = `/folders/${folderId}/upload-contexts`;
     const newDocument = { method: 'POST', body: { purpose: 'NEW_DOCUMENT' } };
 
-    // Membership changes queue rotation jobs; until they finish the folder is not ready.
-    assert.equal((await call(contextsPath, owner.userId, 409, newDocument)).code, 'FOLDER_NOT_READY');
-    await completeFolderRotations(pool, folderId);
     const dashboardBefore = await call('/dashboard/summary', owner.userId, 200);
 
     // 1. Owner uploads V1 for every current member.
@@ -78,13 +76,7 @@ async function main() {
     const dashboardAfter = await call('/dashboard/summary', owner.userId, 200);
     assert.equal(dashboardAfter.documentCount, dashboardBefore.documentCount + 1);
 
-    // 5. A new member waits for rotation and then has no envelope for existing documents.
-    await addFolderMember({ call, owner, folderId, userId: late.userId, role: 'VIEWER' });
-    assert.equal((await call(`/versions/${v2.versionId}/manifest`, viewer.userId, 409)).code, 'FOLDER_NOT_READY');
-    await completeFolderRotations(pool, folderId);
-    assert.equal((await call(`/versions/${v2.versionId}/manifest`, late.userId, 409)).code, 'ENVELOPE_NOT_AVAILABLE');
-
-    // 6. Owner deletes the document; rows and ciphertext objects disappear.
+    // 5. Owner deletes the document and both ciphertext objects.
     const [objects] = await pool.execute(`
       SELECT r.storage_object_key AS objectKey FROM Crypto_Revision AS r
       INNER JOIN Document_Version AS v ON v.version_id = r.version_id WHERE v.document_id = ?
@@ -97,7 +89,69 @@ async function main() {
     }
     const dashboardFinal = await call('/dashboard/summary', owner.userId, 200);
     assert.equal(dashboardFinal.documentCount, dashboardBefore.documentCount);
-    console.log('PASS: upload, versions, conflict, download/decrypt, roles, rotation gate and delete on MySQL');
+    // 6. Membership changes to a populated folder require real rotation.
+    const rotationContext = await call(contextsPath, owner.userId, 201, newDocument);
+    const rotationUpload = await prepareUpload({
+      context: rotationContext, author: owner, plaintext: v1Plain,
+      documentName: 'Rotation smoke test', category: 'OTHER', mimeType: 'text/plain',
+    });
+    const rotationDocument = await call(`/folders/${folderId}/documents`, owner.userId, 201, {
+      method: 'POST', form: rotationUpload.form,
+    });
+    const secondContext = await call(contextsPath, editor.userId, 201, {
+      method: 'POST', body: { purpose: 'NEW_VERSION', documentId: rotationDocument.documentId, baseVersionId: rotationDocument.versionId },
+    });
+    const secondUpload = await prepareUpload({ context: secondContext, author: editor, plaintext: v2Plain, mimeType: 'text/plain' });
+    const secondVersion = await call(`/documents/${rotationDocument.documentId}/versions`, editor.userId, 201, {
+      method: 'POST', form: secondUpload.form,
+    });
+    const { rotationId } = await addFolderMember({ call, owner, folderId, userId: late.userId, role: 'EDITOR' });
+    await assert.rejects(completeFolderRotations(pool, folderId), /folder with documents/);
+    assert.equal((await call(`/key-rotations/${rotationId}`, owner.userId, 200)).status, 'PENDING');
+    const downloadPath = `/versions/${rotationDocument.versionId}`;
+    for (const user of [viewer, late]) {
+      for (const type of ['manifest', 'content']) {
+        assert.equal((await call(`${downloadPath}/${type}`, user.userId, 409)).code, 'FOLDER_NOT_READY');
+      }
+    }
+
+    const cannotClaim = await call(`/key-rotations/${rotationId}/claim`, late.userId, 409, { method: 'POST' });
+    assert.equal(cannotClaim.code, 'ROTATION_SOURCE_UNAVAILABLE');
+    const addedResults = await completeRotation({ call, owner, executor: editor, rotationId, checkGuards: true });
+    assert.equal(addedResults.length, 2);
+    assert.deepEqual(await downloadAndDecrypt({ call, user: late, versionId: rotationDocument.versionId }), v1Plain);
+    assert.deepEqual(await downloadAndDecrypt({ call, user: late, versionId: secondVersion.versionId }), v2Plain);
+    const previousManifest = await call(downloadPath + '/manifest', editor.userId, 200);
+
+    const [[{ membershipId }]] = await pool.execute(`
+      SELECT CAST(membership_id AS CHAR) AS membershipId
+      FROM Folder_Membership WHERE folder_id = ? AND user_id = ? AND status = 'ACTIVE'
+    `, [folderId, viewer.userId]);
+    const revokeContext = await call(`/folders/${folderId}/policy-contexts`, owner.userId, 201, {
+      method: 'POST', body: { action: 'REVOKE_MEMBER', membershipId },
+    });
+    const ownerSignature = await signPayload(owner.keys.signing.privateJwk, {
+      purpose: 'FOLDER_MEMBERSHIP_CHANGE', context: revokeContext,
+    });
+    const revoked = await call(`/folders/${folderId}/members/${membershipId}`, owner.userId, 202, {
+      method: 'DELETE', headers: { 'X-Policy-Context-Id': revokeContext.contextId, 'X-Policy-Signature': ownerSignature },
+    });
+    assert.equal((await call(`/key-rotations/${rotationId}`, owner.userId, 200)).status, 'COMPLETED');
+    assert.equal((await call(`/key-rotations/${revoked.rotationId}`, owner.userId, 200)).status, 'PENDING');
+    for (const type of ['manifest', 'content']) {
+      assert.equal((await call(`${downloadPath}/${type}`, viewer.userId, 404)).code, 'VERSION_NOT_FOUND');
+      assert.equal((await call(`${downloadPath}/${type}`, editor.userId, 409)).code, 'FOLDER_NOT_READY');
+    }
+    await completeRotation({ call, owner, executor: editor, rotationId: revoked.rotationId });
+    assert.deepEqual(await downloadAndDecrypt({ call, user: late, versionId: rotationDocument.versionId }), v1Plain);
+    assert.deepEqual(await downloadAndDecrypt({ call, user: editor, versionId: secondVersion.versionId }), v2Plain);
+    const current = await call(downloadPath + '/manifest', editor.userId, 200);
+    assert.notEqual(current.revisionId, previousManifest.revisionId);
+    assert.equal(current.manifest.recipients.some(({ userId }) => userId === viewer.userId), false);
+    assert.equal((await call(downloadPath + '/content?revisionId=' + previousManifest.revisionId, editor.userId, 409)).code, 'REVISION_CHANGED');
+    assert.equal((await call(downloadPath + '/manifest', viewer.userId, 404)).code, 'VERSION_NOT_FOUND');
+    assert.equal((await call(downloadPath + '/content', viewer.userId, 404)).code, 'VERSION_NOT_FOUND');
+    console.log('PASS: upload, decryption, deletion, and key rotation after adding and revoking members on MySQL');
   } finally {
     if (server) await server.close();
     await pool.end();
