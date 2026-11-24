@@ -3,13 +3,54 @@ const { createFolderRouter } = require('./folders/folder-router');
 const { createMysqlFolderRepository } = require('./folders/mysql-folder-repository');
 const { createFolderPolicyVerifiers } = require('./folders/folder-policy-signatures');
 const { queueMysqlFolderRotation } = require('./folders/mysql-folder-rotation-queue');
+const { createInMemoryAuditRepository } = require('./audit/in-memory-audit-repository');
+const { createMysqlAuditRepository } = require('./audit/mysql-audit-repository');
+const { createAuditService } = require('./audit/audit-service');
+const { createInMemorySessionRepository } = require('./auth/in-memory-session-repository');
+const { createMysqlSessionRepository } = require('./auth/mysql-session-repository');
+const { createAuthService } = require('./auth/auth-service');
+const { createAuthMiddleware } = require('./auth/auth-middleware');
+const { createAuthRouter } = require('./auth/auth-router');
+const { createInMemoryUserRepository } = require('./users/in-memory-user-repository');
+const { createMysqlUserRepository } = require('./users/mysql-user-repository');
+const { createUserService } = require('./users/user-service');
+const { createUsersRouter } = require('./users/users-router');
+const { createAdminUsersRouter } = require('./users/admin-users-router');
+
+const MUTATING_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
+
+function adminFolderMutationGuard(request, response, next) {
+  if (request.user?.accountType === 'ADMIN' && MUTATING_METHODS.has(request.method)) {
+    return response.status(403).json({
+      code: 'FORBIDDEN',
+      message: 'Hospital Administrators cannot create or modify treatment folders.',
+    });
+  }
+  return next();
+}
 
 function createApp({
-  authenticate, mysqlPool, folderRepository, folderPolicyKeys,
-  verifyInitialFolderPolicy, verifyFolderPolicy, queueFolderRotation, canReadRotationSources,
+  authenticate,
+  mysqlPool,
+  folderRepository,
+  folderPolicyKeys,
+  verifyInitialFolderPolicy,
+  verifyFolderPolicy,
+  queueFolderRotation,
+  canReadRotationSources,
   verifyFolderDeletionReauth,
+  authEnabled,
+  authService,
+  userService,
+  auditService,
+  seedUsers,
+  seedDepartments,
+  cookieSecure = true,
+  sessionTtlMs = 8 * 60 * 60 * 1000,
+  reauthTtlMs = 5 * 60 * 1000,
 } = {}) {
   const app = express();
+  const resolvedCookieSecure = cookieSecure ?? true;
 
   app.get('/health/live', (_request, response) => {
     response.status(200).json({ status: 'ok' });
@@ -42,21 +83,108 @@ function createApp({
       </html>
     `);
   });
+
+  let defaultAuthenticate;
+  let defaultRequireCsrf;
+  let defaultRequireAdmin;
+  let defaultVerifyFolderDeletionReauth;
+
+  if (authEnabled !== false) {
+    const auditSvc = auditService ?? createAuditService({
+      auditRepository: mysqlPool
+        ? createMysqlAuditRepository(mysqlPool)
+        : createInMemoryAuditRepository(),
+    });
+
+    let authSvc = authService;
+    let userSvc = userService;
+
+    if (!authSvc || !userSvc) {
+      const userRepo = mysqlPool
+        ? createMysqlUserRepository(mysqlPool)
+        : createInMemoryUserRepository({ seedUsers, seedDepartments });
+      const sessionRepo = mysqlPool
+        ? createMysqlSessionRepository(mysqlPool)
+        : createInMemorySessionRepository({ userRepository: userRepo });
+
+      if (!mysqlPool && typeof userRepo.setRevokeUserSessionsHook === 'function') {
+        userRepo.setRevokeUserSessionsHook((userId, reason) => sessionRepo.revokeUserSessions(userId, reason));
+      }
+
+      authSvc = authSvc ?? createAuthService({
+        userRepository: userRepo,
+        sessionRepository: sessionRepo,
+        auditService: auditSvc,
+        sessionTtlMs,
+        reauthTtlMs,
+      });
+      userSvc = userSvc ?? createUserService({
+        userRepository: userRepo,
+        sessionRepository: sessionRepo,
+        auditService: auditSvc,
+      });
+    }
+
+    const authMiddleware = createAuthMiddleware({ authService: authSvc });
+    defaultAuthenticate = authMiddleware.authenticate;
+    defaultRequireCsrf = authMiddleware.requireCsrf;
+    defaultRequireAdmin = authMiddleware.requireAdmin;
+    defaultVerifyFolderDeletionReauth = authMiddleware.verifyFolderDeletionReauth;
+
+    app.use('/api/v1/auth', createAuthRouter({
+      authService: authSvc,
+      authenticate: defaultAuthenticate,
+      requireCsrf: defaultRequireCsrf,
+      cookieSecure: resolvedCookieSecure,
+    }));
+    app.use('/api/v1/users', createUsersRouter({
+      userService: userSvc,
+      authenticate: defaultAuthenticate,
+    }));
+    app.use('/api/v1/admin/users', createAdminUsersRouter({
+      userService: userSvc,
+      authenticate: defaultAuthenticate,
+      requireAdmin: defaultRequireAdmin,
+      requireCsrf: defaultRequireCsrf,
+    }));
+  }
+
+  const useDefaultAuth = !authenticate && authEnabled !== false;
+  const routeAuth = authenticate ?? (useDefaultAuth ? defaultAuthenticate : undefined);
+  const folderReauthVerifier = authenticate
+    ? verifyFolderDeletionReauth
+    : (useDefaultAuth ? defaultVerifyFolderDeletionReauth : verifyFolderDeletionReauth);
+
   const repository = folderRepository ?? (mysqlPool && createMysqlFolderRepository(mysqlPool));
   const policyVerifiers = typeof folderPolicyKeys?.lookupActiveSigningKey === 'function'
     && typeof folderPolicyKeys?.canReceiveFolderKeys === 'function'
     ? createFolderPolicyVerifiers(folderPolicyKeys)
     : {};
-  app.use('/api/v1/folders', createFolderRouter({
-    authenticate,
+  const folderRouterOptions = {
     folderRepository: repository,
     verifyInitialFolderPolicy: verifyInitialFolderPolicy ?? policyVerifiers.verifyInitialFolderPolicy,
     verifyFolderPolicy: verifyFolderPolicy ?? policyVerifiers.verifyFolderPolicy,
     queueFolderRotation: queueFolderRotation ?? (mysqlPool && !folderRepository ? queueMysqlFolderRotation : undefined),
-    verifyFolderDeletionReauth,
-  }));
+    verifyFolderDeletionReauth: folderReauthVerifier,
+  };
+  if (useDefaultAuth) {
+    app.use(
+      '/api/v1/folders',
+      defaultAuthenticate,
+      defaultRequireCsrf,
+      adminFolderMutationGuard,
+      createFolderRouter(folderRouterOptions),
+    );
+  } else {
+    app.use('/api/v1/folders', createFolderRouter({
+      authenticate,
+      ...folderRouterOptions,
+    }));
+  }
+
   const dashboard = express.Router();
-  if (authenticate) dashboard.use(authenticate);
+  if (routeAuth) dashboard.use(routeAuth);
+  if (useDefaultAuth) dashboard.use(defaultRequireCsrf);
   dashboard.get('/summary', async function getDashboardSummary(request, response) {
     if (!request.user?.id) return response.status(401).json({ code: 'UNAUTHENTICATED' });
     if (typeof repository?.getDashboardSummary !== 'function') {
@@ -66,7 +194,8 @@ function createApp({
   });
   app.use('/api/v1/dashboard', dashboard);
   const rotations = express.Router();
-  if (authenticate) rotations.use(authenticate);
+  if (routeAuth) rotations.use(routeAuth);
+  if (useDefaultAuth) rotations.use(defaultRequireCsrf, adminFolderMutationGuard);
   rotations.use((request, response, next) => {
     response.set('Cache-Control', 'no-store');
     if (!request.user?.id) return response.status(401).json({ code: 'UNAUTHENTICATED' });
@@ -128,7 +257,8 @@ function createApp({
   app.use('/api/v1/key-rotations', rotations);
 
   const operations = express.Router();
-  if (authenticate) operations.use(authenticate);
+  if (routeAuth) operations.use(routeAuth);
+  if (useDefaultAuth) operations.use(defaultRequireCsrf);
   operations.get('/:operationId', async function getOperation(request, response) {
     response.set('Cache-Control', 'no-store');
     if (!request.user?.id) return response.status(401).json({ code: 'UNAUTHENTICATED' });
@@ -143,11 +273,14 @@ function createApp({
 
   app.use((error, _request, response, next) => {
     if (response.headersSent) return next(error);
-    if (error.type === 'entity.parse.failed') {
+    if (error?.type === 'entity.parse.failed') {
       return response.status(400).json({ code: 'INVALID_JSON' });
     }
-    if (error.type === 'entity.too.large') {
+    if (error?.type === 'entity.too.large') {
       return response.status(413).json({ code: 'PAYLOAD_TOO_LARGE' });
+    }
+    if (Number.isInteger(error?.status) && typeof error?.code === 'string') {
+      return response.status(error.status).json({ code: error.code, message: error.message });
     }
     console.error(error);
     response.status(500).json({ code: 'INTERNAL_ERROR' });
